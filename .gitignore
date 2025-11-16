@@ -1,0 +1,28 @@
+# Node / TypeScript
+node_modules/
+dist/
+apps/desktop/backend/dist/
+*.log
+.DS_Store
+
+
+# Tauri / Rust
+desktop/src-tauri/target/
+desktop/src-tauri/.cargo/
+desktop/src-tauri/Cargo.lock
+
+# SQLite databases
+data/*.db
+data/*.db-journal
+
+# Env / secrets
+.env
+.env.*
+.jenv/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.history/
+_archived/

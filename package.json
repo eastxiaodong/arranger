@@ -1,0 +1,97 @@
+{
+  "name": "arranger",
+  "displayName": "Arranger",
+  "description": "Multi-Agent Collaboration Orchestrator for VSCode",
+  "version": "0.1.0",
+  "publisher": "arranger",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "arranger",
+          "title": "Arranger",
+          "icon": "resources/icon-dark.svg"
+        }
+      ]
+    },
+    "views": {
+      "arranger": [
+        {
+          "id": "arranger.arrangerView",
+          "name": "Arranger 面板",
+          "type": "webview",
+          "contextualTitle": "Arranger",
+          "icon": "resources/icon-dark.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "arranger.openPanel",
+        "title": "Arranger: Open Orchestrator",
+        "icon": "$(organization)"
+      },
+      {
+        "command": "arranger.startAgent",
+        "title": "Arranger: Start Agent"
+      },
+      {
+        "command": "arranger.stopAgent",
+        "title": "Arranger: Stop Agent"
+      },
+      {
+        "command": "arranger.createTask",
+        "title": "Arranger: Create Task"
+      },
+      {
+        "command": "arranger.manageMcpServers",
+        "title": "Arranger: Manage MCP Servers"
+      },
+      {
+        "command": "arranger.exportPerformanceSnapshot",
+        "title": "Arranger: Export Performance Snapshot"
+      },
+      {
+        "command": "arranger.workflow.switchTemplate",
+        "title": "Arranger: Switch Workflow Template"
+      },
+      {
+        "command": "arranger.integration.openConfig",
+        "title": "Arranger: Open Integration Config"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "copy:webview": "node ./scripts/copy-webview-assets.js",
+    "build": "tsc && npm run copy:webview",
+    "dev": "npm run copy:webview && tsc --watch",
+    "package": "vsce package",
+    "test": "npm run build"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
+    "@types/sql.js": "^1.4.9",
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vitest/coverage-v8": "^4.0.8",
+    "@vitest/ui": "^4.0.8",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.3",
+    "vite": "^7.2.2",
+    "vitest": "^4.0.8"
+  }
+}
