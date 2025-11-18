@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const SRC_DIR = path.join(__dirname, '..', 'src', 'webview');
-const DIST_DIR = path.join(__dirname, '..', 'dist', 'webview');
+const SRC_DIR = path.join(__dirname, '..', 'src', 'presentation', 'webview');
+const DIST_DIR = path.join(__dirname, '..', 'dist', 'presentation', 'webview');
 const FILES = ['minimal-panel.html'];
 
 fs.mkdirSync(DIST_DIR, { recursive: true });

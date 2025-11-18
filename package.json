@@ -68,20 +68,28 @@
       {
         "command": "arranger.integration.openConfig",
         "title": "Arranger: Open Integration Config"
+      },
+      {
+        "command": "arranger.ace.search",
+        "title": "Arranger: Search with ACE",
+        "icon": "$(search)"
       }
     ]
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "copy:webview": "node ./scripts/copy-webview-assets.js",
-    "build": "tsc && npm run copy:webview",
-    "dev": "npm run copy:webview && tsc --watch",
+    "copy:assets": "node ./scripts/copy-assets.js",
+    "build": "tsc && npm run copy:assets",
+    "dev": "npm run copy:assets && tsc --watch",
     "package": "vsce package",
     "test": "npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.20.0",
     "@types/sql.js": "^1.4.9",
+    "axios": "^1.13.2",
+    "iconv-lite": "^0.7.0",
+    "ignore": "^7.0.5",
     "sql.js": "^1.13.0"
   },
   "devDependencies": {

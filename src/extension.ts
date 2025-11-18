@@ -2,59 +2,20 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { DatabaseManager } from './database';
-import { GlobalConfigDatabase } from './database/global-config.database';
-import { TypedEventEmitter } from './events/emitter';
+import { DatabaseManager } from './core/database';
+import { GlobalConfigDatabase } from './core/database/global-config.database';
+import { TypedEventEmitter } from './core/events/emitter';
 import {
-  AgentService,
-  TaskService,
-  MessageService,
-  TaskContextService,
-  VoteService,
-  ApprovalService,
-  PolicyService,
-  NotificationService,
-  SessionService,
-  ThinkingService,
-  FileChangeService,
-  ContextService,
-  MCPServerService,
-  MCPService,
-  LockService,
-  GovernanceHistoryService,
-  ProofService,
-  ToolExecutionService,
+  createServices,
   type Services
-} from './services';
-import { PolicyEnforcer } from './services/policy-enforcer.service';
-import { AgentEngine } from './agent/engine';
-import { MinimalPanelProvider } from './webview/minimal-panel';
-import { TaskMonitor } from './orchestration/task-monitor';
-import { LockMonitor } from './monitoring/lock-monitor';
-import { MCPMonitor } from './orchestration/mcp-monitor';
-import type { ExtensionConfig, Agent, MCPServer } from './types';
-import { GovernanceMonitor } from './governance/governance-monitor';
-import { PerformanceRecorder } from './monitoring/performance-recorder';
-import { buildConfigFromAgent } from './helpers/agent-config';
-import { AgentRuntimePool } from './orchestration/agent-runtime-pool';
-import { AgentScheduler } from './orchestration/agent-scheduler';
-import { SentinelService } from './orchestration/sentinel.service';
-import { WorkflowOrchestrator } from './workflow/workflow-orchestrator';
-import { WorkflowKernel } from './workflow/workflow-kernel';
-import { WorkflowPluginManager } from './workflow/workflow-plugin-manager';
-import { WorkflowTimelineService } from './workflow/workflow-timeline.service';
-import { WorkflowInterventionService } from './workflow/workflow-intervention.service';
-import {
-  AutoTaskWorkflowPlugin,
-  ClarifierWorkflowPlugin,
-  PlannerWorkflowPlugin,
-  BuilderWorkflowPlugin,
-  MessagePolicyWorkflowPlugin,
-  ProofWorkflowPlugin
-} from './workflow/plugins';
-import { WorkflowTemplateService } from './workflow/workflow-template.service';
-import { WorkspaceConfigManager } from './config/workspace-config';
-import { IntegrationBridge } from './integration/integration-bridge';
+} from './application/services';
+import { AgentEngine } from './domain/agent/agent.engine';
+import { MinimalPanelProvider } from './presentation/webview/minimal-panel';
+import type { ExtensionConfig, Agent, MCPServer, ToolRun } from './core/types';
+import { PerformanceRecorder } from './application/monitoring/performance-recorder';
+import { buildConfigFromAgent } from './presentation/commands/agent-config';
+import { WorkspaceConfigManager } from './infrastructure/config/workspace-config';
+import { IntegrationBridge } from './infrastructure/integration/integration-bridge';
 
 let db: DatabaseManager;
 let globalConfigDb: GlobalConfigDatabase;
@@ -64,27 +25,21 @@ let agentEngine: AgentEngine | undefined;
 let currentSessionId: string | null = null;
 let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
-let voteTimeoutChecker: NodeJS.Timeout | undefined;
-let approvalTimeoutChecker: NodeJS.Timeout | undefined;
 let activeAgentId: string | null = null;
-let governanceMonitor: GovernanceMonitor | undefined;
-let taskMonitor: TaskMonitor | undefined;
-let mcpMonitor: MCPMonitor | undefined;
 let performanceRecorder: PerformanceRecorder | undefined;
-let lockMonitor: LockMonitor | undefined;
-let agentRuntimePool: AgentRuntimePool | undefined;
-let agentScheduler: AgentScheduler | undefined;
-let sentinelService: SentinelService | undefined;
-let workflowKernel: WorkflowKernel | undefined;
-let workflowOrchestrator: WorkflowOrchestrator | undefined;
-let workflowPluginManager: WorkflowPluginManager | undefined;
-let workflowTemplateService: WorkflowTemplateService | undefined;
 let workspaceConfigManager: WorkspaceConfigManager | undefined;
 let integrationBridge: IntegrationBridge | undefined;
-let workflowTimelineService: WorkflowTimelineService | undefined;
-let workflowInterventionService: WorkflowInterventionService | undefined;
 let agentHealthCheckPromise: Promise<void> | null = null;
+const ACE_STALE_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 小时
+const ACE_STALE_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 分钟检查一次
+const ACE_FAILURE_WINDOW_MS = 45 * 60 * 1000; // 45 分钟内连续失败告警
+const ACE_FAILURE_ALERT_COUNT = 2;
+type AceAutoRefreshReason = 'startup' | 'workspace-change' | 'scheduled';
+let aceAutoRefreshTimer: NodeJS.Timeout | null = null;
+let aceRefreshInProgress = false;
+let lastAceFailureAlertRunId: string | null = null;
 type MCPServerInput = Omit<MCPServer, 'id' | 'created_at' | 'updated_at'>;
+let assistDeadlineTimer: NodeJS.Timeout | null = null;
 
 class ArrangerWebviewViewProvider implements vscode.WebviewViewProvider {
   constructor(
@@ -113,32 +68,71 @@ class ArrangerWebviewViewProvider implements vscode.WebviewViewProvider {
 // 获取数据库路径
 function getDatabasePath(): string {
   const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (workspace) {
-    // 工作空间目录优先
-    const dbDir = path.join(workspace, '.arranger');
-    if (!fs.existsSync(dbDir)) {
-      fs.mkdirSync(dbDir, { recursive: true });
+  const globalDir = path.join(os.homedir(), '.arranger');
+  if (!fs.existsSync(globalDir)) {
+    fs.mkdirSync(globalDir, { recursive: true });
+  }
+  const globalDbPath = path.join(globalDir, 'arranger.db');
+
+  if (!workspace) {
+    return globalDbPath;
+  }
+
+  // 优先使用工作区 .arranger；若文件为空则删除后重建，避免误回退到全局导致状态混杂
+  const workspaceDir = path.join(workspace, '.arranger');
+  if (!fs.existsSync(workspaceDir)) {
+    fs.mkdirSync(workspaceDir, { recursive: true });
+  }
+  const workspaceDbPath = path.join(workspaceDir, 'arranger.db');
+  try {
+    if (fs.existsSync(workspaceDbPath)) {
+      const stat = fs.statSync(workspaceDbPath);
+      if (stat.size === 0) {
+        console.warn('[Arranger] 检测到工作区数据库为空文件，重新创建');
+        fs.unlinkSync(workspaceDbPath);
+      } else {
+        return workspaceDbPath;
+      }
     }
-    return path.join(dbDir, 'arranger.db');
+  } catch (err) {
+    console.warn('[Arranger] Failed to stat workspace DB, fallback to global:', err);
+    return globalDbPath;
   }
-  // 备用：用户主目录
-  const dbDir = path.join(os.homedir(), '.arranger');
-  if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
-  }
-  return path.join(dbDir, 'arranger.db');
+  return workspaceDbPath;
 }
 
-function getGlobalConfigPath(context: vscode.ExtensionContext): string {
-  const storageDir = context.globalStorageUri?.fsPath ?? path.join(os.homedir(), '.arranger-global');
+function getGlobalConfigPath(): string {
+  const storageDir = path.join(os.homedir(), '.arranger');
   if (!fs.existsSync(storageDir)) {
     fs.mkdirSync(storageDir, { recursive: true });
   }
-  return path.join(storageDir, 'arranger-global.db');
+  return path.join(storageDir, 'system-setting.db');
 }
 
 function openOrchestratorPanel() {
   vscode.commands.executeCommand('arranger.arrangerView.focus');
+}
+
+
+function setupAssistDeadlineSweep(context: vscode.ExtensionContext) {
+  if (assistDeadlineTimer) {
+    clearInterval(assistDeadlineTimer);
+  }
+  assistDeadlineTimer = setInterval(() => {
+    try {
+      services.assist.runDeadlineSweep();
+    } catch (error: any) {
+      outputChannel.appendLine(`[AssistDeadline] Sweep error: ${error?.message ?? error}`);
+    }
+  }, 60 * 1000);
+  context.subscriptions.push({
+    dispose: () => {
+      if (assistDeadlineTimer) {
+        clearInterval(assistDeadlineTimer);
+        assistDeadlineTimer = null;
+      }
+    }
+  });
 }
 
 async function selectAgent(agents: Agent[]): Promise<Agent | undefined> {
@@ -155,7 +149,7 @@ async function selectAgent(agents: Agent[]): Promise<Agent | undefined> {
     agents.map(agent => ({
       label: `${agent.display_name || agent.id}${agent.is_enabled === false ? ' (已停用)' : ''}`,
       description: `ID: ${agent.id}`,
-      detail: agent.roles && agent.roles.length > 0 ? `角色: ${agent.roles.join(', ')}` : undefined,
+      detail: agent.capability_tags && agent.capability_tags.length > 0 ? `能力: ${agent.capability_tags.join(', ')}` : undefined,
       agentId: agent.id,
       disabled: agent.is_enabled === false
     })),
@@ -190,7 +184,7 @@ export async function activate(context: vscode.ExtensionContext) {
     db = await DatabaseManager.create(dbPath);
     outputChannel.appendLine('Database initialized');
 
-    const globalConfigPath = getGlobalConfigPath(context);
+    const globalConfigPath = getGlobalConfigPath();
     outputChannel.appendLine(`Global config database path: ${globalConfigPath}`);
     globalConfigDb = await GlobalConfigDatabase.create(globalConfigPath);
     outputChannel.appendLine('Global configuration database initialized');
@@ -203,68 +197,16 @@ export async function activate(context: vscode.ExtensionContext) {
     // 初始化事件系统
     events = new TypedEventEmitter();
     outputChannel.appendLine('Event system initialized');
-
-    // 初始化 Workflow Kernel
-    workflowKernel = new WorkflowKernel(events, {
-      logger: {
-        info: (msg: string) => outputChannel.appendLine(`[Workflow] ${msg}`),
-        warn: (msg: string) => outputChannel.appendLine(`[Workflow][warn] ${msg}`),
-        error: (msg: string) => outputChannel.appendLine(`[Workflow][error] ${msg}`)
-      }
-    });
-    context.subscriptions.push({
-      dispose: () => workflowKernel?.dispose()
-    });
-
-    workflowTemplateService = new WorkflowTemplateService(
-      context,
-      workflowKernel,
+    const serviceInit = createServices({
+      db,
+      globalConfigDb,
       events,
-      outputChannel,
-      workspaceConfigManager
-    );
-    workflowTemplateService.initialize();
-    const activeWorkflowId = workflowTemplateService.getActiveTemplateId();
-
-    // 初始化所有服务
-    const agentService = new AgentService(globalConfigDb, db, events);
-    const lockService = new LockService(db);
-    const notificationService = new NotificationService(db, events);
-    const governanceHistoryService = new GovernanceHistoryService(db, events);
-    const proofService = new ProofService(db, events, governanceHistoryService);
-    const taskService = new TaskService(db, events, notificationService, governanceHistoryService, lockService);
-    const messageService = new MessageService(db, events);
-    const taskContextService = new TaskContextService(messageService);
-    const mcpServerService = new MCPServerService(globalConfigDb, events);
-    const mcpService = new MCPService(mcpServerService, events, outputChannel);
-    services = {
-      agent: agentService,
-      task: taskService,
-      message: messageService,
-      vote: new VoteService(db, events, taskService, governanceHistoryService),
-      approval: new ApprovalService(db, events, taskService, governanceHistoryService),
-      policy: new PolicyService(globalConfigDb, events),
-      notification: notificationService,
-      session: new SessionService(db, events),
-      thinking: new ThinkingService(db, events),
-      fileChange: new FileChangeService(db, events),
-      context: new ContextService(outputChannel, mcpService),
-      mcpServer: mcpServerService,
-      mcp: mcpService,
-      lock: lockService,
-      governanceHistory: governanceHistoryService,
-      taskContext: taskContextService,
-      proof: proofService,
-      toolExecution: {} as ToolExecutionService
-    };
-    const toolExecutionService = new ToolExecutionService(db, events, services, workspaceRoot, outputChannel, workflowKernel);
-    services.toolExecution = toolExecutionService;
-    services.mcp.setToolRunRecorder(toolExecutionService);
-    toolExecutionService.start(context);
-    context.subscriptions.push(toolExecutionService);
-    const policyEnforcer = new PolicyEnforcer(services.policy, services.approval, services.vote, notificationService);
-    policyEnforcer.ensureBuiltInPolicies();
-    taskService.setPolicyEnforcer(policyEnforcer);
+      workspaceRoot,
+      outputChannel
+    });
+    services = serviceInit.services;
+    serviceInit.toolExecution.start(context);
+    context.subscriptions.push(serviceInit.toolExecution);
     outputChannel.appendLine('All services initialized');
 
     const existingSessions = services.session.getAllSessions();
@@ -275,50 +217,10 @@ export async function activate(context: vscode.ExtensionContext) {
       outputChannel.appendLine(`[Session] Auto-created default session ${autoSessionId}`);
     }
 
-    if (workflowKernel) {
-      workflowTimelineService = new WorkflowTimelineService(events, workflowKernel, services.message, outputChannel);
-      workflowTimelineService.start(context);
-      context.subscriptions.push({
-        dispose: () => workflowTimelineService?.dispose()
-      });
-      workflowInterventionService = new WorkflowInterventionService(events, workflowKernel, services.task, services.message, outputChannel);
-      workflowInterventionService.start(context);
-      context.subscriptions.push({
-        dispose: () => workflowInterventionService?.dispose()
-      });
-    }
+    void setupAceAutoMonitor(context);
+    setupAssistDeadlineSweep(context);
 
-async function performAgentHealthCheck(services: Services, runtimePool: AgentRuntimePool) {
-  if (agentHealthCheckPromise) {
-    return agentHealthCheckPromise;
-  }
-  agentHealthCheckPromise = (async () => {
-    const agents = services.agent.getAllAgents();
-    const enabledAgents = agents.filter(agent => agent.is_enabled !== false);
-    for (const agent of enabledAgents) {
-      try {
-        if (agent.status === 'online') {
-          continue;
-        }
-        const engine = await runtimePool.ensureEngine(agent.id);
-        await engine.stop();
-        services.agent.updateAgentStatus(agent.id, {
-          status: 'online',
-          status_detail: 'Health-check passed',
-          active_task_id: null
-        });
-        outputChannel.appendLine(`[AgentHealthCheck] Agent ${agent.display_name || agent.id} is online`);
-      } catch (error: any) {
-        services.agent.markAgentOffline(agent.id, error?.message ?? 'Health-check failed');
-        outputChannel.appendLine(`[AgentHealthCheck] Agent ${agent.display_name || agent.id} failed health check: ${error?.message ?? error}`);
-      }
-    }
-    agentHealthCheckPromise = null;
-  })();
-  return agentHealthCheckPromise;
-}
-
-    const minimalPanelProvider = new MinimalPanelProvider(services, events, workflowKernel, workflowTemplateService);
+    const minimalPanelProvider = new MinimalPanelProvider(services, events);
     const arrangerViewProvider = new ArrangerWebviewViewProvider(minimalPanelProvider);
     context.subscriptions.push(
       vscode.window.registerWebviewViewProvider('arranger.arrangerView', arrangerViewProvider, {
@@ -331,54 +233,25 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
 
     const existingAgents = services.agent.getAllAgents();
     if (existingAgents.length === 0) {
-      vscode.window.showWarningMessage('Arranger 需要至少一个 Agent，请在 Agent 管理中添加后再启动。');
-      outputChannel.appendLine('No agents configured. Waiting for user to add agents via UI.');
+      // Create a default agent for new installations
+      const defaultAgent = services.agent.createAgent({
+        id: 'default-agent',
+        display_name: 'Default Agent',
+        capability_tags: ['general'],
+        status: 'offline',
+        is_enabled: true,
+        capabilities: [],
+        tool_permissions: [],
+        last_heartbeat_at: Date.now(),
+        status_detail: null,
+        status_eta: null,
+        active_task_id: null,
+        status_updated_at: null
+      });
+      outputChannel.appendLine(`Created default agent: ${defaultAgent.id}`);
+    } else {
+      outputChannel.appendLine(`Found ${existingAgents.length} configured agents`);
     }
-
-    const startWorkflowPlugins = async (workflowId: string) => {
-      if (!workflowKernel) {
-        return;
-      }
-      if (workflowPluginManager) {
-        workflowPluginManager.dispose();
-      }
-      workflowPluginManager = new WorkflowPluginManager(
-        workflowKernel,
-        services,
-        events,
-        outputChannel,
-        workflowId
-      );
-      workflowPluginManager.register(new AutoTaskWorkflowPlugin());
-      workflowPluginManager.register(new ClarifierWorkflowPlugin());
-      workflowPluginManager.register(new PlannerWorkflowPlugin());
-      workflowPluginManager.register(new BuilderWorkflowPlugin());
-      workflowPluginManager.register(new MessagePolicyWorkflowPlugin());
-      workflowPluginManager.register(new ProofWorkflowPlugin());
-      await workflowPluginManager.start(context);
-      if (integrationBridge && workflowTemplateService) {
-        integrationBridge.setTemplateTargets(workflowTemplateService.getActiveIntegrationTargets());
-      }
-    };
-
-    if (workflowKernel) {
-      workflowOrchestrator = new WorkflowOrchestrator(
-        workflowKernel,
-        services,
-        events,
-        outputChannel,
-        activeWorkflowId
-      );
-      workflowOrchestrator.start(context);
-      await startWorkflowPlugins(activeWorkflowId);
-    }
-
-    taskMonitor = new TaskMonitor(taskService, events, outputChannel);
-    taskMonitor.start();
-    context.subscriptions.push({
-      dispose: () => taskMonitor?.dispose()
-    });
-    outputChannel.appendLine('Task monitor initialized');
 
     performanceRecorder = new PerformanceRecorder(events, outputChannel, workspaceRoot);
     context.subscriptions.push({
@@ -386,88 +259,45 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
     });
     outputChannel.appendLine('Performance recorder initialized');
 
-    lockMonitor = new LockMonitor(lockService, outputChannel);
-    lockMonitor.start();
-    context.subscriptions.push({
-      dispose: () => lockMonitor?.dispose()
-    });
-    outputChannel.appendLine('Lock monitor initialized');
-
-    governanceMonitor = new GovernanceMonitor(
-      {
-        vote: services.vote,
-        approval: services.approval,
-        notification: services.notification,
-        task: services.task
-      },
-      outputChannel
-    );
-    governanceMonitor.start();
-    context.subscriptions.push({
-      dispose: () => governanceMonitor?.dispose()
-    });
-    outputChannel.appendLine('Governance monitor initialized');
-
-    mcpMonitor = new MCPMonitor(mcpServerService, mcpService, events, outputChannel);
-    mcpMonitor.start();
-    context.subscriptions.push({
-      dispose: () => mcpMonitor?.dispose()
-    });
-    outputChannel.appendLine('MCP monitor initialized');
-
-    agentRuntimePool = new AgentRuntimePool(context, services, events, outputChannel);
-    agentRuntimePool.start();
-    context.subscriptions.push(agentRuntimePool);
-    outputChannel.appendLine('Agent runtime pool initialized');
-
-    await performAgentHealthCheck(services, agentRuntimePool);
-
-    agentScheduler = new AgentScheduler(services, events, agentRuntimePool, outputChannel);
-    agentScheduler.start(context);
-    context.subscriptions.push(agentScheduler);
-    outputChannel.appendLine('Agent scheduler started');
-
-    sentinelService = new SentinelService(services, events, workflowKernel, outputChannel);
-    sentinelService.start(context);
-    context.subscriptions.push(sentinelService);
-    outputChannel.appendLine('Sentinel service initialized');
-
     integrationBridge = new IntegrationBridge(workspaceRoot, events, outputChannel);
     integrationBridge.start(context);
-    integrationBridge.setTemplateTargets(workflowTemplateService?.getActiveIntegrationTargets() ?? []);
     outputChannel.appendLine('Integration bridge initialized');
-
-    context.subscriptions.push(vscode.commands.registerCommand('arranger.workflow.switchTemplate', async () => {
-      if (!workflowTemplateService) {
-        vscode.window.showWarningMessage('Workflow 模板服务尚未准备就绪');
-        return;
-      }
-      const templates = workflowTemplateService.listTemplates();
-      const pick = await vscode.window.showQuickPick(
-        templates.map(template => ({
-          label: template.name,
-          description: template.description,
-          detail: template.tags?.join(', ') || undefined,
-          templateId: template.id
-        })),
-        { placeHolder: '选择 Workflow 模板' }
-      );
-      if (!pick) {
-        return;
-      }
-      try {
-        workflowTemplateService.applyTemplate(pick.templateId);
-        workflowOrchestrator?.setDefaultWorkflowId(pick.templateId);
-        await startWorkflowPlugins(pick.templateId);
-        vscode.window.showInformationMessage(`Workflow 模板已切换为 ${pick.label}`);
-      } catch (error: any) {
-        vscode.window.showErrorMessage(error?.message ?? '切换模板失败');
-      }
-    }));
 
     context.subscriptions.push(vscode.commands.registerCommand('arranger.integration.openConfig', () => {
       integrationBridge?.openConfig();
     }));
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.ace.search', async () => {
+        if (!services.aceContext.isConfigured()) {
+          const pick = await vscode.window.showInformationMessage(
+            'ACE 尚未配置，无法执行搜索。请在 Arranger 面板的“ACE 集成”中设置 Base URL 和 Token。'
+          );
+          return;
+        }
+        const query = await vscode.window.showInputBox({
+          prompt: '输入需要搜索的上下文关键词',
+          placeHolder: '例如：logging configuration or user authentication',
+          ignoreFocusOut: true
+        });
+        if (!query || !query.trim()) {
+          return;
+        }
+        const trimmedQuery = query.trim();
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: 'ACE 搜索中...'
+          },
+          async () => {
+            const result = await services.aceContext.search(trimmedQuery);
+            outputChannel.appendLine(`[ACE] Query: ${trimmedQuery}`);
+            outputChannel.appendLine(result);
+            vscode.window.showInformationMessage('ACE 搜索完成，结果已写入 Arranger 输出。');
+          }
+        );
+      })
+    );
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.text = 'Arranger';
@@ -499,10 +329,7 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
           return;
         }
 
-        if (agentRuntimePool?.isEngineActive(agentRecord.id)) {
-          vscode.window.showInformationMessage(`Agent ${agentRecord.display_name || agentRecord.id} 已由自动调度运行，无需手动启动。`);
-          return;
-        }
+
 
         const agentConfig = buildConfigFromAgent(agentRecord);
 
@@ -577,8 +404,6 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
     vscode.commands.registerCommand('arranger.runPerformanceCheck', async () => {
       try {
         const metrics = services.task.getTaskMetrics();
-        const pendingVotes = services.vote.getAllTopics({ status: 'pending' });
-        const pendingApprovals = services.approval.getAllApprovals({ decision: 'pending' });
         const unreadNotifications = services.notification.getAllNotifications({ read: false });
         outputChannel.appendLine('--- Arranger Performance Snapshot ---');
         outputChannel.appendLine(`Tasks: total=${metrics.total}, running=${metrics.running}, queued=${metrics.queued}, blocked=${metrics.blocked}, failed=${metrics.failed}`);
@@ -588,7 +413,6 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
         if (metrics.last_timeout) {
           outputChannel.appendLine(`Last timeout: ${metrics.last_timeout.message}`);
         }
-        outputChannel.appendLine(`Pending votes: ${pendingVotes.length}, pending approvals: ${pendingApprovals.length}`);
         outputChannel.appendLine(`Unread notifications: ${unreadNotifications.length}`);
         outputChannel.appendLine('--------------------------------------');
         vscode.window.showInformationMessage('性能快照已写入 Arranger 输出面板');
@@ -692,41 +516,6 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
 
     // 状态栏项已在前面创建
 
-    // 启动投票超时检查定时器（每分钟检查一次）
-    voteTimeoutChecker = setInterval(() => {
-      try {
-        services.vote.checkTimeouts();
-      } catch (error: any) {
-        outputChannel.appendLine(`Vote timeout check error: ${error.message}`);
-      }
-    }, 60000); // 60秒 = 1分钟
-    context.subscriptions.push({
-      dispose: () => {
-        if (voteTimeoutChecker) {
-          clearInterval(voteTimeoutChecker);
-          voteTimeoutChecker = undefined;
-        }
-      }
-    });
-    outputChannel.appendLine('Vote timeout checker started (interval: 60s)');
-
-    approvalTimeoutChecker = setInterval(() => {
-      try {
-        services.approval.checkTimeouts();
-      } catch (error: any) {
-        outputChannel.appendLine(`Approval timeout check error: ${error.message}`);
-      }
-    }, 60000);
-    context.subscriptions.push({
-      dispose: () => {
-        if (approvalTimeoutChecker) {
-          clearInterval(approvalTimeoutChecker);
-          approvalTimeoutChecker = undefined;
-        }
-      }
-    });
-    outputChannel.appendLine('Approval timeout checker started (interval: 60s)');
-
     outputChannel.appendLine('=== Arranger Extension Activated Successfully ===');
   } catch (error: any) {
     outputChannel.appendLine(`=== ACTIVATION ERROR: ${error.message} ===`);
@@ -737,22 +526,161 @@ async function performAgentHealthCheck(services: Services, runtimePool: AgentRun
 }
 
 export function deactivate() {
-  // 清理定时器
-  if (voteTimeoutChecker) {
-    clearInterval(voteTimeoutChecker);
-    voteTimeoutChecker = undefined;
-  }
-  if (approvalTimeoutChecker) {
-    clearInterval(approvalTimeoutChecker);
-    approvalTimeoutChecker = undefined;
-  }
-  governanceMonitor?.dispose();
   services?.mcp?.dispose();
+  services?.managerOrchestrator?.dispose?.();
+  services?.state?.dispose?.();
+  if (aceAutoRefreshTimer) {
+    clearInterval(aceAutoRefreshTimer);
+    aceAutoRefreshTimer = null;
+  }
 
   if (events) {
     events.removeAllListeners();
   }
   outputChannel?.appendLine('=== Arranger Extension Deactivated ===');
+}
+
+async function setupAceAutoMonitor(context: vscode.ExtensionContext) {
+  if (!services?.aceContext) {
+    return;
+  }
+  const workspaceListener = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+    void maybeAutoRefreshAce('workspace-change');
+  });
+  context.subscriptions.push(workspaceListener);
+
+  if (aceAutoRefreshTimer) {
+    clearInterval(aceAutoRefreshTimer);
+  }
+  aceAutoRefreshTimer = setInterval(() => {
+    void maybeAutoRefreshAce('scheduled');
+  }, ACE_STALE_CHECK_INTERVAL_MS);
+  context.subscriptions.push({
+    dispose: () => {
+      if (aceAutoRefreshTimer) {
+        clearInterval(aceAutoRefreshTimer);
+        aceAutoRefreshTimer = null;
+      }
+    }
+  });
+
+  await maybeAutoRefreshAce('startup');
+}
+
+async function maybeAutoRefreshAce(reason: AceAutoRefreshReason) {
+  if (!services?.aceContext?.isConfigured() || !services.toolExecution) {
+    return;
+  }
+  if (aceRefreshInProgress) {
+    return;
+  }
+  const runs = services.toolExecution.getRuns(undefined, 100);
+  const now = Date.now();
+  const lastIndexSuccess = runs.find(run => isAceRun(run, 'index') && run.status === 'succeeded');
+  const lastIndexAt = lastIndexSuccess ? getRunTimestamp(lastIndexSuccess) : 0;
+  const isStale = !lastIndexAt || now - lastIndexAt > ACE_STALE_THRESHOLD_MS;
+  const shouldRefresh = reason === 'workspace-change' ? services.aceContext.isConfigured() : isStale;
+
+  if (!shouldRefresh) {
+    maybeNotifyAceFailures(runs);
+    return;
+  }
+
+  aceRefreshInProgress = true;
+  const notifyForReason = reason !== 'workspace-change';
+  try {
+    if (notifyForReason && isStale) {
+      services.notification.sendNotification({
+        session_id: currentSessionId || 'global',
+        level: 'warning',
+        title: 'ACE 索引已过期',
+        message: '超过 6 小时未刷新，正在自动更新索引…',
+        metadata: { reason }
+      });
+    }
+    outputChannel.appendLine(`[ACE] Auto-refresh triggered (${reason})`);
+    await services.aceContext.refreshIndex();
+    if (notifyForReason) {
+      services.notification.sendNotification({
+        session_id: currentSessionId || 'global',
+        level: 'success',
+        title: 'ACE 索引已更新',
+        message: isStale ? '索引已自动刷新，ACE 可以继续使用。' : '因上下文变化已刷新索引。',
+        metadata: { reason }
+      });
+    }
+  } catch (error: any) {
+    const message = error?.message ?? 'ACE 自动刷新失败';
+    services.notification.sendNotification({
+      session_id: currentSessionId || 'global',
+      level: 'error',
+      title: 'ACE 自动刷新失败',
+      message,
+      metadata: { reason }
+    });
+    outputChannel.appendLine(`[ACE] Auto-refresh failed (${reason}): ${message}`);
+  } finally {
+    aceRefreshInProgress = false;
+    const refreshedRuns = services.toolExecution.getRuns(undefined, 100);
+    maybeNotifyAceFailures(refreshedRuns);
+  }
+}
+
+function getRunTimestamp(run: ToolRun): number {
+  return run.completed_at ?? run.started_at ?? run.created_at ?? Date.now();
+}
+
+function isAceRun(run: ToolRun, type?: 'index' | 'search' | 'test'): boolean {
+  if (!run) {
+    return false;
+  }
+  const normalized = run.tool_name?.startsWith('ace:')
+    ? run.tool_name.split(':')[1]
+    : undefined;
+  if (!normalized && run.runner !== 'ace') {
+    return false;
+  }
+  if (!type) {
+    return true;
+  }
+  if (normalized === type) {
+    return true;
+  }
+  if (type === 'search' && run.command?.startsWith('search')) {
+    return true;
+  }
+  if (type === 'index' && run.command === 'index') {
+    return true;
+  }
+  if (type === 'test' && run.command?.includes('test')) {
+    return true;
+  }
+  return false;
+}
+
+function maybeNotifyAceFailures(runs: ToolRun[]) {
+  if (!services?.notification || !Array.isArray(runs)) {
+    return;
+  }
+  const now = Date.now();
+  const recentFailures = runs.filter(run => isAceRun(run) && run.status === 'failed' && now - getRunTimestamp(run) <= ACE_FAILURE_WINDOW_MS);
+  if (recentFailures.length < ACE_FAILURE_ALERT_COUNT) {
+    return;
+  }
+  const newest = recentFailures[0];
+  if (lastAceFailureAlertRunId === newest.id) {
+    return;
+  }
+  lastAceFailureAlertRunId = newest.id;
+  services.notification.sendNotification({
+    session_id: currentSessionId || 'global',
+    level: 'warning',
+    title: 'ACE 多次运行失败',
+    message: `最近 ${recentFailures.length} 次 ACE 操作均失败，请检查 Base URL 或 Token。`,
+    metadata: {
+      run_ids: recentFailures.slice(0, 3).map(run => run.id)
+    }
+  });
 }
 
 async function manageMcpServers(services: Services, output: vscode.OutputChannel) {

@@ -1,0 +1,1 @@
+export { TypedEventEmitter } from './emitter';

@@ -6,6 +6,7 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
+    "noImplicitAny": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
@@ -14,6 +15,6 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "webview", "src/workflow/__tests__"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "webview", "src/workflow/__tests__", "src/**/*.html"]
 }
