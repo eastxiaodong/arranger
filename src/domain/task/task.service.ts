@@ -11,10 +11,13 @@ import type {
   TaskStatus,
   TaskBacklogSummary,
   TaskState,
-  TaskStateRecord
+  TaskStateRecord,
+  AgentHealthRecord
 } from '../../core/types';
 import type { StateStore } from '../state';
 import type { AgentService } from '../agent/agent.service';
+import type { AceContextService } from '../../application/services/ace-context.service';
+import type { MessageService } from '../communication/message.service';
 
 const MAX_CONCURRENT_TASKS_PER_SESSION = 3;
 const MAX_PARALLEL_SIBLINGS = 1;
@@ -22,6 +25,7 @@ const SERIALIZED_SCOPES = new Set(['workspace']);
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟
 const DEFAULT_MAX_RETRIES = 2;
 const RETRY_BACKOFF_BASE_MS = 60 * 1000; // 60 秒
+const MAX_CONCURRENT_PER_AGENT = 1;
 
 interface TimeoutOutcome {
   task: Task;
@@ -40,7 +44,9 @@ export class TaskService {
     private events: TypedEventEmitter,
     private readonly stateStore: StateStore,
     private readonly agentService: AgentService,
+    private readonly aceContext?: AceContextService,
     private notificationService?: NotificationService,
+    private messageService?: MessageService,
   ) {}
 
   private broadcastTasks(): void {
@@ -152,13 +158,17 @@ export class TaskService {
   }
 
   private enforceScheduling(sessionId: string): boolean {
-    const tasks = this.db.getTasks({ session_id: sessionId });
+    let tasks = this.db.getTasks({ session_id: sessionId });
     if (tasks.length === 0) {
       return false;
     }
+    const reassigned = this.requeueTasksWithUnavailableAgents(tasks);
+    if (reassigned) {
+      tasks = this.db.getTasks({ session_id: sessionId });
+    }
     const recovered = this.recoverStuckTasks(tasks).changed;
     const concurrencyChanged = this.applyConcurrencyRules(tasks);
-    return recovered || concurrencyChanged;
+    return reassigned || recovered || concurrencyChanged;
   }
 
   private normalizeDependencyList(dependencies: any[], taskId: string): string[] {
@@ -271,6 +281,7 @@ export class TaskService {
     if (updated && nextStatus === 'completed') {
       const sessions = this.unblockDependentTasks(id);
       sessions.forEach(sessionId => this.scheduleSessions(new Set([sessionId])));
+      void this.syncAceForTask(updated);
     }
     if (updated && nextStatus === 'failed') {
       this.blockDependentsOnFailure(id, reason || '任务失败', this.db.getTasks({}), new Set());
@@ -350,6 +361,8 @@ export class TaskService {
     switch (status) {
       case 'running':
         return 'active';
+      case 'needs-confirm':
+        return 'needs-confirm';
       case 'completed':
         return 'done';
       case 'failed':
@@ -379,7 +392,20 @@ export class TaskService {
     if (task.assigned_to || !task.intent) {
       return;
     }
-    const candidates = this.agentService.getAllAgents().filter(agent => agent.is_enabled !== false);
+    const state = this.stateStore.getTaskState(task.id);
+    if (!state) {
+      return;
+    }
+    // 优先使用调度评分统一选人
+    try {
+      const best = this.scheduler?.tryAssignBestAgent(state);
+      if (best) {
+        return;
+      }
+    } catch (error) {
+      // ignore scheduler errors, fallback to legacy scoring
+    }
+    const candidates = this.agentService.getOnlineLLMAgents();
     if (!candidates.length) {
       return;
     }
@@ -595,7 +621,10 @@ export class TaskService {
     } else if (status === 'assigned') {
       updates.run_after = null;
     }
-    this.updateTaskRecord(id, updates);
+    const updated = this.updateTaskRecord(id, updates);
+    if (updated && (status === 'assigned' || status === 'running')) {
+      void this.prefetchAceContext(updated);
+    }
     const sessionId = existing?.session_id ?? this.db.getTask(id)?.session_id ?? null;
     if (sessionId) {
       this.scheduleSessions(new Set([sessionId]));
@@ -610,11 +639,14 @@ export class TaskService {
       return;
     }
     const status = this.canExecuteTask(taskId) ? 'assigned' : 'blocked';
-    this.updateTaskRecord(taskId, {
+    const updated = this.updateTaskRecord(taskId, {
       assigned_to: agentId,
       status,
       run_after: null
     });
+    if (updated && status === 'assigned') {
+      void this.prefetchAceContext(updated);
+    }
     this.scheduleSessions(new Set([task.session_id]));
     this.broadcastTasks();
   }
@@ -700,6 +732,7 @@ export class TaskService {
     const updated = this.db.getTask(id);
     if (updated) {
       this.events.emit('task_completed', updated);
+      void this.syncAceForTask(updated);
     }
   }
 
@@ -752,7 +785,7 @@ export class TaskService {
     const tasks = this.db.getTasks({ session_id: sessionId });
     return tasks
       .filter(task =>
-        (task.status === 'assigned' || task.status === 'queued') &&
+        (task.status === 'assigned' || task.status === 'queued' || task.status === 'blocked') &&
         this.canExecuteTask(task.id) &&
         (!task.run_after || task.run_after <= Date.now())
       )
@@ -826,7 +859,8 @@ export class TaskService {
     const sessionIds = new Set<string>();
     blockedTasks.forEach(task => {
       if (this.canExecuteTask(task.id)) {
-        this.updateTaskRecord(task.id, { status: 'assigned', run_after: null });
+        // 解除阻塞后回到队列等待调度，避免直接占用 slot
+        this.updateTaskRecord(task.id, { status: 'queued', run_after: null });
         sessionIds.add(task.session_id);
       }
     });
@@ -921,7 +955,6 @@ export class TaskService {
     const siblingUsage = new Map<string, number>();
     const scopeUsage = new Map<string, number>();
     const agentUsage = new Map<string, number>();
-    const MAX_CONCURRENT_PER_AGENT = 1;
 
     runningTasks.forEach(task => {
       if (task.parent_task_id) {
@@ -956,6 +989,19 @@ export class TaskService {
     const updates: Array<{ id: string; updates: Partial<Task> }> = [];
 
     readyCandidates.forEach(task => {
+      if (task.assigned_to) {
+        const availability = this.isAgentAvailable(task.assigned_to);
+        if (!availability.available) {
+          updates.push({
+            id: task.id,
+            updates: {
+              assigned_to: null,
+              status: task.status === 'blocked' ? 'blocked' : 'queued'
+            }
+          });
+          return;
+        }
+      }
       const siblingLimited = this.isSiblingLimited(task, siblingUsage);
       const scopeLimited = this.isScopeLimited(task, scopeUsage);
       const agentLimited = task.assigned_to
@@ -1027,6 +1073,94 @@ export class TaskService {
 
   private computeBackoff(retryCount: number): number {
     return RETRY_BACKOFF_BASE_MS * Math.pow(2, Math.min(retryCount, 4));
+  }
+
+  /**
+   * 将指定 Agent 的任务退回队列，供重新调度
+   */
+  reassignTasksForAgent(agentId: string, reason: string): number {
+    const tasks = this.db.getTasks({ assigned_to: agentId });
+    if (!tasks || tasks.length === 0) {
+      return 0;
+    }
+    let changed = 0;
+    tasks.forEach(task => {
+      const nextStatus: Task['status'] = task.status === 'blocked' ? 'blocked' : 'queued';
+      this.updateTaskRecord(task.id, {
+        assigned_to: null,
+        status: nextStatus,
+        result_summary: task.result_summary || undefined
+      });
+      changed++;
+      this.notificationService?.sendNotification({
+        session_id: task.session_id,
+        level: 'warning',
+        title: '任务重新排队',
+        message: `任务 ${task.id} 的 Agent ${agentId} 不可用，已回队等待重新指派（${reason}）`,
+        metadata: {
+          task_id: task.id,
+          agent_id: agentId,
+          reason
+        }
+      });
+    });
+    if (changed > 0) {
+      this.broadcastTasks();
+    }
+    return changed;
+  }
+
+  private requeueTasksWithUnavailableAgents(tasks: Task[]): boolean {
+    let changed = false;
+    tasks.forEach(task => {
+      if (!task.assigned_to) {
+        return;
+      }
+      if (task.status === 'running') {
+        return;
+      }
+      const availability = this.isAgentAvailable(task.assigned_to);
+      if (availability.available) {
+        return;
+      }
+      const previousAssignee = task.assigned_to;
+      const nextStatus: Task['status'] = task.status === 'blocked' ? 'blocked' : 'queued';
+      this.updateTaskRecord(task.id, {
+        assigned_to: null,
+        status: nextStatus
+      });
+      changed = true;
+      this.notificationService?.sendNotification({
+        session_id: task.session_id,
+        level: 'warning',
+        title: '任务重新排队',
+        message: `任务 ${task.id} 的指派 Agent 不可用（${availability.reason || '未知原因'}），已回到队列等待重新指派。`,
+        metadata: {
+          task_id: task.id,
+          agent_id: previousAssignee,
+          reason: availability.reason || 'unavailable_agent'
+        }
+      });
+    });
+    return changed;
+  }
+
+  private isAgentAvailable(agentId: string): { available: boolean; reason?: string } {
+    const agent = this.agentService.getAgent(agentId);
+    if (!agent) {
+      return { available: false, reason: 'Agent 不存在' };
+    }
+    if (agent.is_enabled === false) {
+      return { available: false, reason: 'Agent 已停用' };
+    }
+    if (agent.status === 'offline') {
+      return { available: false, reason: 'Agent 离线' };
+    }
+    const health: AgentHealthRecord | null = this.stateStore.getAgentHealth(agentId);
+    if (health && (health.status === 'offline' || health.status === 'unhealthy')) {
+      return { available: false, reason: 'Agent 健康状态不可用' };
+    }
+    return { available: true };
   }
 
   private calculateTaskMetrics(tasks: Task[], sessionId?: string): TaskMetrics {
@@ -1119,6 +1253,78 @@ export class TaskService {
     });
   }
 
+  /**
+   * 在任务进入 assigned/运行前，主动从 ACE 检索上下文，提示 Agent 参考历史产出。
+   */
+  private async prefetchAceContext(task: Task): Promise<void> {
+    if (!this.aceContext || typeof this.aceContext.isConfigured !== 'function') {
+      return;
+    }
+    if (!this.aceContext.isConfigured()) {
+      return;
+    }
+    const metadata = task.metadata && typeof task.metadata === 'object' ? { ...task.metadata } : {};
+    if (metadata.ace_prefetched) {
+      return;
+    }
+    const query = [task.title, task.intent, task.description].filter(Boolean).join(' ').slice(0, 200);
+    try {
+      const result = await this.aceContext.search(query || '当前任务');
+      metadata.ace_prefetched = true;
+      metadata.ace_context = result;
+      this.updateTaskRecord(task.id, { metadata });
+      this.pushAceContextMessage(task, result, 'success');
+      this.notificationService?.sendNotification({
+        session_id: task.session_id,
+        level: 'info',
+        title: 'ACE 检索完成',
+        message: `任务 ${task.id} 已检索历史上下文，建议参考`,
+        metadata: { task_id: task.id }
+      });
+    } catch (error: any) {
+      metadata.ace_prefetched = true;
+      metadata.ace_context_error = error?.message ?? '检索失败';
+      this.updateTaskRecord(task.id, { metadata });
+      this.pushAceContextMessage(task, metadata.ace_context_error, 'error');
+      this.notificationService?.sendNotification({
+        session_id: task.session_id,
+        level: 'warning',
+        title: 'ACE 检索失败',
+        message: `任务 ${task.id} 检索失败：${metadata.ace_context_error}`,
+        metadata: { task_id: task.id }
+      });
+    }
+  }
+
+  private pushAceContextMessage(task: Task, raw: string, status: 'success' | 'error') {
+    if (!this.messageService) return;
+    const snippet = (raw || '').toString().slice(0, 600);
+    const suffix = raw && raw.length > 600 ? '…' : '';
+    const assignedAgent = task.assigned_to || undefined;
+    const content = status === 'success'
+      ? `ACE 检索到相关上下文（任务 ${task.id}）：${snippet}${suffix}`
+      : `ACE 检索失败（任务 ${task.id}）：${snippet}${suffix}`;
+    this.messageService.sendMessage({
+      id: `ace_ctx_${task.id}_${Date.now()}`,
+      session_id: task.session_id,
+      agent_id: 'ace_context',
+      content,
+      priority: 'medium',
+      tags: ['ace'],
+      reply_to: null,
+      references: [`task:${task.id}`],
+      reference_type: 'task',
+      reference_id: task.id,
+      mentions: assignedAgent ? [assignedAgent] : null,
+      expires_at: null,
+      category: 'agent_summary',
+      visibility: 'blackboard',
+      payload: {
+        status
+      }
+    });
+  }
+
   private getMaxRetries(task: Task): number {
     if (typeof task.max_retries === 'number' && task.max_retries >= 0) {
       return task.max_retries;
@@ -1140,7 +1346,8 @@ export class TaskService {
 
   private prepareTaskInput(task: CreateTaskInput): CreateTaskInput {
     const normalizedTitle = this.humanizeTaskTitle(task);
-    const dependencies = (task.dependencies || []).filter(Boolean);
+    const baseDependencies = Array.from(new Set((task.dependencies || []).filter(Boolean).map(dep => String(dep))));
+    const dependencies = this.mergeCrossBatchDependencies(task, baseDependencies);
     const canExecute = dependencies.length === 0 || dependencies.every(depId => {
       const depTask = this.db.getTask(depId);
       return depTask && depTask.status === 'completed';
@@ -1176,6 +1383,98 @@ export class TaskService {
       run_after: task.run_after ?? null,
       last_started_at: task.last_started_at ?? null
     };
+  }
+
+  /**
+   * 记录用户反馈/协助笔记，写入任务 metadata 并推送黑板
+   */
+  recordUserFeedback(taskId: string, feedback: { type: 'task' | 'process' | 'priority'; content: string; author?: string }): void {
+    const task = this.db.getTask(taskId);
+    if (!task) {
+      throw new Error(`任务 ${taskId} 不存在`);
+    }
+    const entry = {
+      id: `fb_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      type: feedback.type,
+      content: feedback.content,
+      author: feedback.author || 'user',
+      created_at: Date.now()
+    };
+    const metadata = task.metadata ? { ...task.metadata } : {};
+    const feedbackList = Array.isArray((metadata as any).feedback) ? [...(metadata as any).feedback] : [];
+    feedbackList.unshift(entry);
+    (metadata as any).feedback = feedbackList.slice(0, 50);
+    const updates: Partial<Task> = { metadata };
+    if (feedback.type === 'priority') {
+      const lowered = feedback.content.toLowerCase();
+      if (lowered.includes('高') || lowered.includes('high')) {
+        updates.priority = 'high';
+      } else if (lowered.includes('低') || lowered.includes('low')) {
+        updates.priority = 'low';
+      } else if (lowered.includes('中') || lowered.includes('medium') || lowered.includes('中等')) {
+        updates.priority = 'medium';
+      }
+    }
+    this.updateTask(taskId, updates);
+    this.messageService?.sendMessage({
+      id: `fb_msg_${entry.id}`,
+      session_id: task.session_id,
+      agent_id: feedback.author || 'user',
+      content: `📌 任务反馈（${feedback.type}）：${feedback.content}`,
+      priority: feedback.type === 'priority' ? 'high' : 'medium',
+      tags: ['feedback', feedback.type],
+      reply_to: null,
+      references: [taskId],
+      reference_type: 'task',
+      reference_id: taskId,
+      mentions: null,
+      expires_at: null,
+      category: 'user',
+      visibility: 'blackboard',
+      payload: { feedback_id: entry.id }
+    });
+  }
+
+  /**
+   * 跨批次依赖归并：同一会话/计划/目标的任务自动依赖未完成的上游任务
+   */
+  private mergeCrossBatchDependencies(task: CreateTaskInput, baseDeps: string[]): string[] {
+    const merged = new Set<string>(baseDeps);
+    const planLabel = this.extractPlanSourceLabel(task.labels);
+    const goalId = (task.metadata as any)?.goal_id || (task.metadata as any)?.plan_root_id || null;
+    const parentId = task.parent_task_id || null;
+
+    if (!planLabel && !goalId && !parentId) {
+      return Array.from(merged);
+    }
+
+    const unfinishedStatuses = new Set<Task['status']>([
+      'pending',
+      'queued',
+      'assigned',
+      'running',
+      'blocked',
+      'paused'
+    ]);
+    const sessionTasks = this.db.getTasks({ session_id: task.session_id });
+    sessionTasks.forEach(existing => {
+      if (existing.id === task.id) {
+        return;
+      }
+      if (!unfinishedStatuses.has(existing.status)) {
+        return;
+      }
+      const existingPlan = this.extractPlanSourceLabel(existing.labels);
+      const existingGoal = (existing.metadata as any)?.goal_id || (existing.metadata as any)?.plan_root_id || null;
+      const samePlan = planLabel && existingPlan === planLabel;
+      const sameGoal = goalId && existingGoal && goalId === existingGoal;
+      const sameParentChain = parentId && (existing.parent_task_id === parentId || existing.id === parentId);
+      if (samePlan || sameGoal || sameParentChain) {
+        merged.add(existing.id);
+      }
+    });
+
+    return Array.from(merged);
   }
 
   private humanizeTaskTitle(task: CreateTaskInput): string {
@@ -1214,5 +1513,33 @@ export class TaskService {
 
   private logTaskEvent(task: Task, action: string, summary: string | null, payload?: Record<string, any> | null) {
     // Governance logging removed
+  }
+
+  private async syncAceForTask(task: Task): Promise<void> {
+    if (!this.aceContext) {
+      return;
+    }
+    try {
+      if (!this.aceContext.isConfigured()) {
+        return;
+      }
+      await this.aceContext.refreshIndex();
+      this.notificationService?.sendNotification({
+        session_id: task.session_id,
+        level: 'info',
+        title: 'ACE 已同步',
+        message: `任务 ${task.id} 结果已写入索引`,
+        metadata: { taskId: task.id }
+      });
+    } catch (error: any) {
+      console.warn('[TaskService] ACE 索引失败:', error?.message || error);
+      this.notificationService?.sendNotification({
+        session_id: task.session_id,
+        level: 'warning',
+        title: 'ACE 同步失败',
+        message: `任务 ${task.id} 索引失败：${error?.message || error}`,
+        metadata: { taskId: task.id, error: error?.message || String(error) }
+      });
+    }
   }
 }

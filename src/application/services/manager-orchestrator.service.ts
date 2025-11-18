@@ -58,6 +58,19 @@ export class ManagerOrchestratorService {
    // 每个会话的节流时间戳，避免刷屏
   private readonly sessionThrottle = new Map<string, number>();
   private readonly minDispatchIntervalMs = 2000;
+  private resolveAssignee(agentId?: string | null): string | null {
+    if (!agentId) {
+      return null;
+    }
+    const agent = this.options.agentService.getAgent(agentId);
+    const hasLLM = !!agent?.llm_provider && !!agent.llm_model && !!agent.llm_api_key;
+    if (!agent || agent.is_enabled === false || agent.status === 'offline' || !hasLLM) {
+      this.options.output.appendLine(`[ManagerOrchestrator] 忽略无效指派，Agent 不存在/已停用/离线/无LLM配置：${agentId}`);
+      return null;
+    }
+    return agent.id;
+  }
+
   private readonly handleMessage = (entry: BlackboardEntry) => {
     if (!this.shouldDispatch(entry)) {
       return;
@@ -490,9 +503,14 @@ export class ManagerOrchestratorService {
 
   private async applyDecision(sessionId: string, decision: ManagerDecision, intent: ManagerIntent) {
     try {
+      // 保障跨批次任务串行：新批次的首个任务依赖于当前会话最后一个未完成任务
+      let prevCreatedTaskId: string | null = this.findSessionTailTask(sessionId);
       if (Array.isArray(decision.tasks)) {
         for (const task of decision.tasks) {
-          await this.applyTaskDecision(sessionId, task, intent);
+          const createdId = await this.applyTaskDecision(sessionId, task, intent, prevCreatedTaskId);
+          if (createdId) {
+            prevCreatedTaskId = createdId;
+          }
         }
       }
       if (Array.isArray(decision.assists)) {
@@ -514,10 +532,33 @@ export class ManagerOrchestratorService {
     }
   }
 
-  private async applyTaskDecision(sessionId: string, task: NonNullable<ManagerDecision['tasks']>[number], intent: ManagerIntent) {
+  /**
+   * 找到会话内最新的未完成任务（非 completed/failed），作为新批次的依赖起点
+   */
+  private findSessionTailTask(sessionId: string): string | null {
+    try {
+      const tasks = this.options.taskService.getAllTasks({ session_id: sessionId });
+      const open = tasks
+        .filter(t => t.status !== 'completed' && t.status !== 'failed')
+        .sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+      return open.length ? open[open.length - 1].id : null;
+    } catch (error: any) {
+      this.options.output.appendLine(`[ManagerOrchestrator] findSessionTailTask error: ${error?.message ?? error}`);
+      return null;
+    }
+  }
+
+  private async applyTaskDecision(
+    sessionId: string,
+    task: NonNullable<ManagerDecision['tasks']>[number],
+    intent: ManagerIntent,
+    previousTaskId: string | null
+  ): Promise<string | null> {
     if (task.action === 'create') {
+      const resolvedAssignee = this.resolveAssignee(task.assignee);
       const { difficultyLabel, priority } = this.estimateDifficulty(task.title, task.description);
       const typeLabel = this.classifyTaskType(task.title || task.description || intent.content);
+      const dependencies = previousTaskId ? [previousTaskId] : null;
       const created = this.options.taskService.createTask({
         id: `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         session_id: sessionId,
@@ -528,10 +569,10 @@ export class ManagerOrchestratorService {
         priority: task.priority ?? priority,
         labels: this.mergeLabels(this.buildTaskLabels(intent.reference?.id, difficultyLabel), typeLabel ? [typeLabel] : []),
         due_at: null,
-        status: 'pending',
-        assigned_to: task.assignee ?? null,
+        status: dependencies ? 'blocked' : 'pending',
+        assigned_to: resolvedAssignee,
         parent_task_id: null,
-        dependencies: null,
+        dependencies,
         result_summary: null,
         result_details: null,
         result_artifacts: null,
@@ -548,7 +589,7 @@ export class ManagerOrchestratorService {
         agent_id: 'manager_llm',
         content: `已创建任务「${task.title}」${created.assigned_to ? `，指派给 ${created.assigned_to}` : ''}。类型：${typeLabel?.replace('type:', '') || 'misc'} · 难度：${difficultyLabel?.replace('difficulty:', '') || '中'}`,
         priority: priority,
-        tags: ['manager', `task:${created.id}`],
+        tags: ['经理', `任务:${created.id}`],
         reply_to: intent.messageId,
         references: [created.id],
         reference_type: 'task',
@@ -576,25 +617,36 @@ export class ManagerOrchestratorService {
           }
         });
       }
+      return created.id;
     }
     if (task.action === 'update') {
       // 仅支持更新优先级/指派，且必须有 task.id
       if (!task.id) {
         this.options.output.appendLine('[ManagerOrchestrator] update 任务缺少 id，已忽略');
-        return;
+        return null;
       }
       const updates: any = {};
       if (task.priority) updates.priority = task.priority;
-      if (task.assignee !== undefined) updates.assigned_to = task.assignee;
-      if (Object.keys(updates).length) {
+      if (task.assignee !== undefined) updates.assigned_to = this.resolveAssignee(task.assignee);
+      // 委托调度评分自动选人：若未显式指派，则尝试自动分配
+      if (updates.assigned_to === undefined) {
+        const targetTask = this.options.taskService.getTask(task.id);
+        if (targetTask) {
+          this.options.scheduler.tryAssignBestAgent(targetTask);
+        }
+      } else if (Object.keys(updates).length) {
         this.options.taskService.updateTask(task.id, updates);
+      }
+      // 仅在有更新或自动指派时发送提示
+      if (task.priority || updates.assigned_to === null || updates.assigned_to) {
+        const assignedLabel = updates.assigned_to ? `，指派给 ${updates.assigned_to}` : updates.assigned_to === null ? '，指派已清空' : '';
         this.options.messageService.sendMessage({
           id: `mgr_task_update_${task.id}_${Date.now()}`,
           session_id: sessionId,
           agent_id: 'manager_llm',
-          content: `已更新任务 ${task.id}${task.assignee ? `，指派给 ${task.assignee}` : ''}${task.priority ? `，优先级=${task.priority}` : ''}`,
+          content: `已更新任务 ${task.id}${assignedLabel}${task.priority ? `，优先级=${task.priority}` : ''}`,
           priority: task.priority ?? 'medium',
-          tags: ['manager', `task:${task.id}`],
+          tags: ['经理', `任务:${task.id}`],
           reply_to: intent.messageId,
           references: [task.id],
           reference_type: 'task',
@@ -609,21 +661,21 @@ export class ManagerOrchestratorService {
             priority: task.priority ?? null
           }
         });
-        if (this.options.notificationService) {
-          this.options.notificationService.sendNotification({
-            session_id: sessionId,
-            level: 'info',
-            title: '经理更新任务',
-            message: `任务 ${task.id}${task.assignee ? ` 指派给 ${task.assignee}` : ''}${task.priority ? ` 优先级 ${task.priority}` : ''}`,
-            metadata: {
-              task_id: task.id,
-              assigned_to: task.assignee ?? null,
-              priority: task.priority ?? null
-            }
-          });
-        }
+        this.options.notificationService?.sendNotification({
+          session_id: sessionId,
+          level: 'info',
+          title: '经理更新任务',
+          message: `任务 ${task.id}${assignedLabel}${task.priority ? ` 优先级 ${task.priority}` : ''}`,
+          metadata: {
+            task_id: task.id,
+            assigned_to: task.assignee ?? null,
+            priority: task.priority ?? null
+          }
+        });
       }
+      return null;
     }
+    return null;
   }
 
   private async handleDirectAgentReply(entry: BlackboardEntry, agentId: string) {

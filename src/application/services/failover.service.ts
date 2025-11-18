@@ -4,6 +4,8 @@ import type { TaskService } from '../../domain/task/task.service';
 import type { StateStore } from '../../domain/state';
 import type { TypedEventEmitter } from '../../core/events/emitter';
 import type { Agent, TaskStateRecord, AgentHealthRecord } from '../../core/types';
+import type { NotificationService } from '../../domain/communication/notification.service';
+import type { MessageService } from '../../domain/communication/message.service';
 
 interface FailoverContext {
   taskId: string;
@@ -49,9 +51,46 @@ export class FailoverService {
     private readonly taskService: TaskService,
     private readonly state: StateStore,
     private readonly events: TypedEventEmitter,
-    private readonly output: OutputChannel
+    private readonly output: OutputChannel,
+    private readonly notificationService?: NotificationService,
+    private readonly messageService?: MessageService
   ) {
     this.initializeManagerPool();
+  }
+
+  start() {
+    this.events.on('state:agent_health_updated', (health: AgentHealthRecord) => {
+      this.handleAgentHealthChange(health);
+    });
+    this.events.on('state:task_transitioned', ({ taskState }: { taskState: TaskStateRecord }) => {
+      if (taskState.assignedTo) {
+        this.managerPool.taskCountSinceRotation += 1;
+        if (this.shouldRotateManager()) {
+          this.rotateManager('轮值阈值已达');
+        }
+      }
+    });
+  }
+
+  private handleAgentHealthChange(health: AgentHealthRecord) {
+    if (health.status === 'offline' || health.status === 'unhealthy') {
+      const reason = health.status === 'offline' ? '离线' : '健康异常';
+      const affected = this.taskService.reassignTasksForAgent(health.agentId, reason);
+      if (affected > 0) {
+        this.output.appendLine(`[Failover] Agent ${health.agentId} ${reason}，已回队 ${affected} 个任务等待重指派`);
+      }
+      if (this.isCurrentManager(health.agentId)) {
+        const rotated = this.rotateManager(`当前经理 ${health.agentId} ${reason}`);
+        if (rotated) {
+          this.notifyManagerSwitch(health.agentId, rotated, reason);
+        }
+      }
+    }
+
+    if (this.shouldDegradeAgent(health) && health.status !== 'degraded') {
+      this.state.updateAgentHealth(health.agentId, { status: 'degraded' });
+      this.output.appendLine(`[Failover] Agent ${health.agentId} 标记为降级（错误率/心跳异常）`);
+    }
   }
 
   /**
@@ -105,6 +144,38 @@ export class FailoverService {
     );
 
     return newManager;
+  }
+
+  private isCurrentManager(agentId: string): boolean {
+    return this.managerPool.managers[this.managerPool.currentIndex] === agentId;
+  }
+
+  private notifyManagerSwitch(oldManager: string, newManager: string, reason?: string) {
+    const message = `经理切换：${oldManager} → ${newManager}${reason ? `（${reason}）` : ''}`;
+    this.notificationService?.sendNotification({
+      session_id: 'global',
+      level: 'warning',
+      title: '经理已切换',
+      message,
+      metadata: { old_manager: oldManager, new_manager: newManager, reason }
+    });
+    this.messageService?.sendMessage({
+      id: `mgr_switch_${Date.now()}`,
+      session_id: 'global',
+      agent_id: 'failover',
+      content: message,
+      priority: 'medium',
+      tags: ['manager', 'failover'],
+      reply_to: null,
+      references: null,
+      reference_type: null,
+      reference_id: null,
+      mentions: null,
+      expires_at: null,
+      category: 'system_event',
+      visibility: 'blackboard',
+      payload: { old_manager: oldManager, new_manager: newManager, reason }
+    });
   }
 
   /**
@@ -234,6 +305,11 @@ export class FailoverService {
 
       const health = context.agentHealthMap.get(agent.id);
       if (health && (health.status === 'offline' || health.status === 'degraded')) {
+        return false;
+      }
+
+      const hasLLM = !!agent.llm_provider && !!agent.llm_model && !!agent.llm_api_key;
+      if (!agent.is_enabled || agent.status === 'offline' || !hasLLM) {
         return false;
       }
 

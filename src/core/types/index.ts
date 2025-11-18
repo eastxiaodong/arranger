@@ -31,10 +31,7 @@ export interface AgentMetrics {
 export type AgentStatus = 'online' | 'offline' | 'busy';
 
 // 任务状态
-export type TaskStatus = 'pending' | 'queued' | 'assigned' | 'running' | 'completed' | 'failed' | 'blocked' | 'paused';
-
-// 消息类型
-export type MessageType = 'discussion' | 'decision' | 'question' | 'warning' | 'suggestion' | 'system' | 'requirement';
+export type TaskStatus = 'pending' | 'queued' | 'assigned' | 'running' | 'completed' | 'failed' | 'blocked' | 'paused' | 'needs-confirm';
 
 export type BlackboardReferenceType = 'task' | 'file' | 'proof' | 'message' | 'notification' | 'custom';
 
@@ -203,45 +200,6 @@ export interface AceSettings {
   batchSize: number;
   maxLinesPerBlob: number;
   excludePatterns: string[];
-}
-
-export type ProofType = 'work' | 'agreement';
-export type ProofAttestationStatus = 'pending' | 'approved' | 'rejected';
-
-export interface ProofRecord {
-  id: string;
-  session_id: string | null;
-  workflow_id: string;
-  workflow_instance_id: string;
-  phase_id: string;
-  proof_type: ProofType;
-  task_id: string | null;
-  description: string | null;
-  evidence_uri: string | null;
-  hash: string | null;
-  acknowledgers: string[] | null;
-  created_by: string | null;
-  created_at: number;
-  updated_at: number;
-  attestation_status: ProofAttestationStatus;
-  attestor_id: string | null;
-  attested_at: number | null;
-  attestation_note: string | null;
-  metadata: Record<string, any> | null;
-}
-
-export interface ProofReportResult {
-  session_id: string | null;
-  workflow_id: string;
-  workflow_instance_id: string;
-  generated_at: number;
-  stats: {
-    total: number;
-    approved: number;
-    pending: number;
-    rejected: number;
-  };
-  markdown: string;
 }
 
 export interface FileChange {

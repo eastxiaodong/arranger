@@ -5,8 +5,7 @@ import type {
   ThinkingStep,
   ToolCall,
   ThinkingStepType,
-  AgentRole,
-  MessageType
+  AgentRole
 } from '../../core/types';
 
 interface RequirementPlanTask {
@@ -971,7 +970,6 @@ ${task.description || task.intent}
   }
 
   private broadcastTaskSummary(task: Task, sessionId: string, summary: string) {
-    const messageType = this.mapTaskIntentToMessageType(task.intent);
     const content = this.buildTaskSummaryContent(task, summary);
     const workflowRole = this.getTaskWorkflowRole(task);
     const workflowPersona = this.getWorkflowPersonaFromRole(workflowRole, task.intent);
@@ -1024,29 +1022,6 @@ ${task.description || task.intent}
       visibility: 'event_log',
       payload: payload || null
     });
-  }
-
-  private mapTaskIntentToMessageType(intent?: string | null): MessageType {
-    const normalized = (intent || '').toLowerCase();
-    const mapping: Record<string, MessageType> = {
-      clarify_requirement: 'requirement',
-      analyze_requirement: 'requirement',
-      requirement_analysis: 'requirement',
-      create_architecture_plan: 'decision',
-      architecture_plan: 'decision',
-      plan_solution: 'decision',
-      implement_requirement: 'discussion',
-      implement_ui: 'discussion',
-      implement_backend: 'discussion',
-      deliver_requirement: 'decision',
-      qa_signoff: 'decision',
-      submit_verify_evidence: 'decision',
-      release_approval: 'decision',
-      handle_warning: 'warning',
-      answer_question: 'question',
-      evaluate_suggestion: 'suggestion'
-    };
-    return mapping[normalized] || 'discussion';
   }
 
   private formatSummaryForBlackboard(summary?: string | null): string {

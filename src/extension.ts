@@ -211,8 +211,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const existingSessions = services.session.getAllSessions();
     if (existingSessions.length === 0) {
-      const autoSessionId = `session-${Date.now()}`;
-      const autoSession = services.session.createSession(autoSessionId, { auto_created: true });
+      const autoSessionId = 'session-default';
+      const autoSession = services.session.createSession(autoSessionId);
       currentSessionId = autoSession.id;
       outputChannel.appendLine(`[Session] Auto-created default session ${autoSessionId}`);
     }

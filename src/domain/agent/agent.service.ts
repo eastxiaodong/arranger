@@ -3,14 +3,18 @@
 import { DatabaseManager } from '../../core/database';
 import { GlobalConfigDatabase } from '../../core/database/global-config.database';
 import { TypedEventEmitter } from '../../core/events/emitter';
-import type { Agent } from '../../core/types';
+import type { Agent, AgentHealthRecord, AgentHealthStatus } from '../../core/types';
+import type { StateStore } from '../state';
 
 export class AgentService {
   constructor(
     private globalDb: GlobalConfigDatabase,
     private projectDb: DatabaseManager,
-    private events: TypedEventEmitter
-  ) {}
+    private events: TypedEventEmitter,
+    private readonly state?: StateStore
+  ) {
+    this.syncAllAgentHealth();
+  }
 
   // 获取所有 Agent
   getAllAgents(): Agent[] {
@@ -36,6 +40,7 @@ export class AgentService {
       notes: agent.notes ?? null
     };
     const created = this.globalDb.createAgent(normalized);
+    this.syncAgentHealth(created);
     this.broadcastAgents();
     return created;
   }
@@ -43,24 +48,33 @@ export class AgentService {
   // 更新 Agent
   updateAgent(id: string, updates: Partial<Agent>): void {
     this.globalDb.updateAgent(id, updates);
+    const updated = this.globalDb.getAgent(id);
+    if (updated) {
+      this.syncAgentHealth(updated);
+    }
     this.broadcastAgents();
   }
 
   setAgentEnabled(id: string, enabled: boolean): void {
     this.globalDb.updateAgent(id, { is_enabled: enabled });
+    const updated = this.globalDb.getAgent(id);
+    if (updated) {
+      this.syncAgentHealth(updated);
+    }
     this.broadcastAgents();
   }
 
   // 删除 Agent
   deleteAgent(id: string): void {
     this.globalDb.deleteAgent(id);
+    this.state?.deleteAgentHealth(id);
     this.broadcastAgents();
   }
 
   // 获取在线且配置了 LLM 的 Agent
   getOnlineLLMAgents(): Agent[] {
     return this.globalDb.getAllAgents().filter(agent => {
-      const hasLLM = !!agent.llm_provider && !!agent.llm_api_key;
+      const hasLLM = !!agent.llm_provider && !!agent.llm_model && !!agent.llm_api_key;
       return agent.is_enabled !== false && agent.status === 'online' && hasLLM;
     });
   }
@@ -68,10 +82,11 @@ export class AgentService {
   // 根据能力标签获取 Agent
   getAgentsByCapability(tag: string): Agent[] {
     const lower = tag.toLowerCase();
-    return this.globalDb.getAllAgents().filter(agent =>
-      agent.is_enabled !== false &&
-      (agent.capability_tags || agent.capabilities || []).some(cap => cap.toLowerCase() === lower)
-    );
+    return this.globalDb.getAllAgents().filter(agent => {
+      const hasLLM = !!agent.llm_provider && !!agent.llm_model && !!agent.llm_api_key;
+      const hasCapability = (agent.capability_tags || agent.capabilities || []).some(cap => cap.toLowerCase() === lower);
+      return agent.is_enabled !== false && agent.status === 'online' && hasLLM && hasCapability;
+    });
   }
 
   // 获取负载最低的 Agent
@@ -120,6 +135,10 @@ export class AgentService {
     this.globalDb.updateAgent(id, {
       last_heartbeat_at: Date.now()
     });
+    const updated = this.globalDb.getAgent(id);
+    if (updated) {
+      this.syncAgentHealth(updated);
+    }
     this.broadcastAgents();
   }
 
@@ -131,6 +150,10 @@ export class AgentService {
       status_eta: eta || null,
       status_updated_at: Date.now()
     });
+    const updated = this.globalDb.getAgent(id);
+    if (updated) {
+      this.syncAgentHealth(updated);
+    }
     this.broadcastAgents();
   }
 
@@ -145,6 +168,10 @@ export class AgentService {
       ...updates,
       status_updated_at: Date.now()
     });
+    const updated = this.globalDb.getAgent(id);
+    if (updated) {
+      this.syncAgentHealth(updated);
+    }
     this.broadcastAgents();
   }
 
@@ -158,5 +185,63 @@ export class AgentService {
       status_detail: reason || '自动标记为离线',
       active_task_id: null
     });
+  }
+
+  private mapHealthStatus(agent: Agent): AgentHealthStatus {
+    if (agent.is_enabled === false || agent.status === 'offline') {
+      return 'offline';
+    }
+    if (agent.status === 'busy') {
+      return 'degraded';
+    }
+    return 'healthy';
+  }
+
+  private computeErrorRate(agent: Agent, completed: number, failed: number): number {
+    const total = completed + failed;
+    if (total > 0) {
+      return failed / total;
+    }
+    if (typeof agent.metrics?.success_rate === 'number') {
+      return Math.max(0, 1 - agent.metrics.success_rate);
+    }
+    return 0;
+  }
+
+  private syncAgentHealth(agent: Agent) {
+    if (!this.state) {
+      return;
+    }
+    const tasks = this.projectDb.getTasks({ assigned_to: agent.id });
+    const activeStatuses = new Set(['pending', 'queued', 'assigned', 'running', 'blocked', 'paused']);
+    const activeTaskCount = tasks.filter(task => activeStatuses.has(task.status)).length;
+    const completedTaskCount = tasks.filter(task => task.status === 'completed').length;
+    const failedTaskCount = tasks.filter(task => task.status === 'failed').length;
+    const health: AgentHealthRecord = {
+      agentId: agent.id,
+      status: this.mapHealthStatus(agent),
+      lastHeartbeat: agent.last_heartbeat_at || Date.now(),
+      activeTaskCount,
+      completedTaskCount,
+      failedTaskCount,
+      avgResponseTime: agent.metrics?.average_response_ms ?? 0,
+      errorRate: this.computeErrorRate(agent, completedTaskCount, failedTaskCount),
+      capabilities: (agent.capability_tags || agent.capabilities || []) as string[],
+      metadata: {
+        display_name: agent.display_name,
+        status_detail: agent.status_detail,
+        status_eta: agent.status_eta,
+        metrics: agent.metrics || null
+      },
+      updatedAt: Date.now()
+    };
+    this.state.updateAgentHealth(agent.id, health);
+  }
+
+  private syncAllAgentHealth() {
+    if (!this.state) {
+      return;
+    }
+    this.globalDb.getAllAgents().forEach(agent => this.syncAgentHealth(agent));
   }
 }

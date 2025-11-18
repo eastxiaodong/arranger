@@ -8,7 +8,6 @@ import type {
   Notification,
   ThinkingLog,
   TaskResult,
-  ProofRecord,
   BlackboardCategory,
   BlackboardVisibility,
   ToolRun,
@@ -123,7 +122,7 @@ export class DatabaseManager {
       );
     `);
 
-    // Blackboard Entries - 黑板消息表（message_type 已废弃，依赖外部 schema 删除该列）
+    // Blackboard Entries - 黑板消息表
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS blackboard_entries (
         id TEXT PRIMARY KEY,
@@ -132,27 +131,6 @@ export class DatabaseManager {
         content TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(id)
-      );
-    `);
-
-    // Topics - 投票主题表（已废弃，保留用于数据迁移）
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS topics (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        FOREIGN KEY (session_id) REFERENCES sessions(id)
-      );
-    `);
-
-    // Votes - 投票表（已废弃，保留用于数据迁移）
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS votes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic_id TEXT NOT NULL,
-        agent_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        FOREIGN KEY (topic_id) REFERENCES topics(id)
       );
     `);
 
@@ -178,19 +156,6 @@ export class DatabaseManager {
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         started_at INTEGER NOT NULL
-      );
-    `);
-
-    // Governance History - 治理历史表
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS governance_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        action TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        FOREIGN KEY (session_id) REFERENCES sessions(id)
       );
     `);
 
@@ -301,19 +266,6 @@ export class DatabaseManager {
         file_path TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(id)
-      );
-    `);
-
-    // Proof Records - 证明记录表
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS proof_records (
-        id TEXT PRIMARY KEY,
-        workflow_id TEXT NOT NULL,
-        workflow_instance_id TEXT NOT NULL,
-        phase_id TEXT NOT NULL,
-        proof_type TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
       );
     `);
   }
@@ -442,20 +394,6 @@ export class DatabaseManager {
     ensureColumn('file_changes', 'line_changes', "ALTER TABLE file_changes ADD COLUMN line_changes TEXT");
     ensureColumn('file_changes', 'reason', "ALTER TABLE file_changes ADD COLUMN reason TEXT");
 
-    // ==================== Proof Records 表字段 ====================
-    ensureColumn('proof_records', 'session_id', "ALTER TABLE proof_records ADD COLUMN session_id TEXT");
-    ensureColumn('proof_records', 'task_id', "ALTER TABLE proof_records ADD COLUMN task_id TEXT");
-    ensureColumn('proof_records', 'description', "ALTER TABLE proof_records ADD COLUMN description TEXT");
-    ensureColumn('proof_records', 'evidence_uri', "ALTER TABLE proof_records ADD COLUMN evidence_uri TEXT");
-    ensureColumn('proof_records', 'hash', "ALTER TABLE proof_records ADD COLUMN hash TEXT");
-    ensureColumn('proof_records', 'acknowledgers', "ALTER TABLE proof_records ADD COLUMN acknowledgers TEXT");
-    ensureColumn('proof_records', 'created_by', "ALTER TABLE proof_records ADD COLUMN created_by TEXT");
-    ensureColumn('proof_records', 'attestation_status', "ALTER TABLE proof_records ADD COLUMN attestation_status TEXT DEFAULT 'pending'");
-    ensureColumn('proof_records', 'attestor_id', "ALTER TABLE proof_records ADD COLUMN attestor_id TEXT");
-    ensureColumn('proof_records', 'attested_at', "ALTER TABLE proof_records ADD COLUMN attested_at INTEGER");
-    ensureColumn('proof_records', 'attestation_note', "ALTER TABLE proof_records ADD COLUMN attestation_note TEXT");
-    ensureColumn('proof_records', 'metadata', "ALTER TABLE proof_records ADD COLUMN metadata TEXT");
-
     // ==================== 数据修复和默认值设置 ====================
     // 确保 tasks 表的默认值
     this.db.prepare("UPDATE tasks SET priority = 'medium' WHERE priority IS NULL OR priority = ''").run();
@@ -467,24 +405,11 @@ export class DatabaseManager {
    * 创建索引
    */
   private createIndexes() {
-    // 清理投票重复数据，确保唯一索引可创建
-    this.db.exec(`
-      DELETE FROM votes
-      WHERE rowid NOT IN (
-        SELECT MIN(rowid)
-        FROM votes
-        GROUP BY topic_id, agent_id
-      );
-    `);
-
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
       CREATE INDEX IF NOT EXISTS idx_blackboard_session ON blackboard_entries(session_id);
-      CREATE INDEX IF NOT EXISTS idx_topics_session ON topics(session_id);
-      CREATE INDEX IF NOT EXISTS idx_topics_status ON topics(status);
-      CREATE INDEX IF NOT EXISTS idx_votes_topic ON votes(topic_id);
       CREATE INDEX IF NOT EXISTS idx_notifications_session ON notifications(session_id);
       CREATE INDEX IF NOT EXISTS idx_thinking_logs_task ON thinking_logs(task_id);
       CREATE INDEX IF NOT EXISTS idx_thinking_logs_agent ON thinking_logs(agent_id);
@@ -492,15 +417,6 @@ export class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_file_changes_task ON file_changes(task_id);
       CREATE INDEX IF NOT EXISTS idx_file_changes_agent ON file_changes(agent_id);
       CREATE INDEX IF NOT EXISTS idx_file_changes_path ON file_changes(file_path);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_votes_topic_agent_unique ON votes(topic_id, agent_id);
-      CREATE INDEX IF NOT EXISTS idx_governance_history_type ON governance_history(type);
-      CREATE INDEX IF NOT EXISTS idx_governance_history_entity ON governance_history(entity_id);
-      CREATE INDEX IF NOT EXISTS idx_governance_history_created_at ON governance_history(created_at);
-      CREATE INDEX IF NOT EXISTS idx_governance_history_session ON governance_history(session_id);
-      CREATE INDEX IF NOT EXISTS idx_proof_records_session ON proof_records(session_id);
-      CREATE INDEX IF NOT EXISTS idx_proof_records_instance ON proof_records(workflow_instance_id);
-      CREATE INDEX IF NOT EXISTS idx_proof_records_phase ON proof_records(phase_id);
-      CREATE INDEX IF NOT EXISTS idx_proof_records_status ON proof_records(attestation_status);
       CREATE INDEX IF NOT EXISTS idx_tool_runs_session ON tool_runs(session_id);
       CREATE INDEX IF NOT EXISTS idx_tool_runs_task ON tool_runs(task_id);
     `);
@@ -556,23 +472,18 @@ export class DatabaseManager {
     }
     this.withTransaction(() => {
       const sessionId = id;
-      const deleteVotesStmt = this.db.prepare(`
-        DELETE FROM votes WHERE topic_id IN (
-          SELECT id FROM topics WHERE session_id = ?
-        )
-      `);
       const tablesWithSession = [
         'file_changes',
         'thinking_logs',
         'notifications',
         'blackboard_entries',
-        'topics',
         'tasks',
-        'governance_history',
-        'proof_records'
+        'tool_runs',
+        'state_task_states',
+        'state_assist_requests',
+        'state_sensitive_operation_logs'
       ];
 
-      deleteVotesStmt.run(sessionId);
       tablesWithSession.forEach((table) => {
         const stmt = this.db.prepare(`DELETE FROM ${table} WHERE session_id = ?`);
         stmt.run(sessionId);
@@ -1679,6 +1590,7 @@ export class DatabaseManager {
   }): ToolRun {
     const now = Date.now();
     const startedAt = run.started_at ?? now;
+    const sessionId = run.session_id ?? 'global';
     const stmt = this.db.prepare(`
       INSERT INTO tool_runs (
         id, session_id, task_id, workflow_instance_id, tool_name, runner, source,
@@ -1689,7 +1601,7 @@ export class DatabaseManager {
 
     stmt.run(
       run.id,
-      run.session_id ?? null,
+      sessionId,
       run.task_id ?? null,
       run.workflow_instance_id ?? null,
       run.tool_name,
@@ -1828,244 +1740,6 @@ export class DatabaseManager {
   }
 
   // ==================== Governance History (REMOVED) ====================
-
-  // ==================== Proof Records ====================
-
-  upsertProofRecord(record: { id: string } & Partial<Omit<ProofRecord, 'id' | 'created_at' | 'updated_at'>> & {
-    created_at?: number;
-    updated_at?: number;
-  }): ProofRecord {
-    if (!record?.id) {
-      throw new Error('Proof record id is required');
-    }
-    const existing = this.getProofRecord(record.id);
-    if (!existing) {
-      const requiredFields: Array<keyof ProofRecord> = ['workflow_id', 'workflow_instance_id', 'phase_id', 'proof_type'];
-      requiredFields.forEach(field => {
-        if ((record as any)[field] === undefined || (record as any)[field] === null) {
-          throw new Error(`Proof record ${field} is required`);
-        }
-      });
-    }
-    const now = Date.now();
-    const merged: ProofRecord = {
-      id: record.id,
-      session_id: record.session_id ?? existing?.session_id ?? null,
-      workflow_id: record.workflow_id ?? existing?.workflow_id ?? '',
-      workflow_instance_id: record.workflow_instance_id ?? existing?.workflow_instance_id ?? '',
-      phase_id: record.phase_id ?? existing?.phase_id ?? '',
-      proof_type: record.proof_type ?? existing?.proof_type ?? 'work',
-      task_id: record.task_id ?? existing?.task_id ?? null,
-      description: record.description ?? existing?.description ?? null,
-      evidence_uri: record.evidence_uri ?? existing?.evidence_uri ?? null,
-      hash: record.hash ?? existing?.hash ?? null,
-      acknowledgers: record.acknowledgers ?? existing?.acknowledgers ?? null,
-      created_by: record.created_by ?? existing?.created_by ?? null,
-      attestation_status: record.attestation_status ?? existing?.attestation_status ?? 'pending',
-      attestor_id: record.attestor_id ?? existing?.attestor_id ?? null,
-      attested_at: record.attested_at ?? existing?.attested_at ?? null,
-      attestation_note: record.attestation_note ?? existing?.attestation_note ?? null,
-      metadata: record.metadata ?? existing?.metadata ?? null,
-      created_at: existing?.created_at ?? record.created_at ?? now,
-      updated_at: record.updated_at ?? now
-    };
-
-    if (!merged.workflow_id || !merged.workflow_instance_id || !merged.phase_id) {
-      throw new Error('Proof record missing workflow metadata');
-    }
-
-    const acknowledgersJson = merged.acknowledgers ? JSON.stringify(merged.acknowledgers) : null;
-    const metadataJson = merged.metadata ? JSON.stringify(merged.metadata) : null;
-
-    if (existing) {
-      const stmt = this.db.prepare(`
-        UPDATE proof_records
-        SET
-          session_id = ?,
-          workflow_id = ?,
-          workflow_instance_id = ?,
-          phase_id = ?,
-          proof_type = ?,
-          task_id = ?,
-          description = ?,
-          evidence_uri = ?,
-          hash = ?,
-          acknowledgers = ?,
-          created_by = ?,
-          attestation_status = ?,
-          attestor_id = ?,
-          attested_at = ?,
-          attestation_note = ?,
-          metadata = ?,
-          updated_at = ?
-        WHERE id = ?
-      `);
-      stmt.run(
-        merged.session_id,
-        merged.workflow_id,
-        merged.workflow_instance_id,
-        merged.phase_id,
-        merged.proof_type,
-        merged.task_id,
-        merged.description,
-        merged.evidence_uri,
-        merged.hash,
-        acknowledgersJson,
-        merged.created_by,
-        merged.attestation_status,
-        merged.attestor_id,
-        merged.attested_at,
-        merged.attestation_note,
-        metadataJson,
-        merged.updated_at,
-        merged.id
-      );
-    } else {
-      const stmt = this.db.prepare(`
-        INSERT INTO proof_records (
-          id,
-          session_id,
-          workflow_id,
-          workflow_instance_id,
-          phase_id,
-          proof_type,
-          task_id,
-          description,
-          evidence_uri,
-          hash,
-          acknowledgers,
-          created_by,
-          attestation_status,
-          attestor_id,
-          attested_at,
-          attestation_note,
-          metadata,
-          created_at,
-          updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      stmt.run(
-        merged.id,
-        merged.session_id,
-        merged.workflow_id,
-        merged.workflow_instance_id,
-        merged.phase_id,
-        merged.proof_type,
-        merged.task_id,
-        merged.description,
-        merged.evidence_uri,
-        merged.hash,
-        acknowledgersJson,
-        merged.created_by,
-        merged.attestation_status,
-        merged.attestor_id,
-        merged.attested_at,
-        merged.attestation_note,
-        metadataJson,
-        merged.created_at,
-        merged.updated_at
-      );
-    }
-
-    return this.getProofRecord(merged.id)!;
-  }
-
-  getProofRecord(id: string): ProofRecord | null {
-    const stmt = this.db.prepare('SELECT * FROM proof_records WHERE id = ?');
-    const row = stmt.get(id);
-    if (!row) {
-      return null;
-    }
-    return this.mapProofRecordRow(row);
-  }
-
-  getProofRecords(filters?: {
-    session_id?: string | null;
-    workflow_instance_id?: string;
-    workflow_id?: string;
-    phase_id?: string;
-    attestation_status?: ProofRecord['attestation_status'];
-  }): ProofRecord[] {
-    let query = 'SELECT * FROM proof_records WHERE 1=1';
-    const params: any[] = [];
-
-    if (filters?.session_id) {
-      query += ' AND session_id = ?';
-      params.push(filters.session_id);
-    }
-    if (filters?.workflow_instance_id) {
-      query += ' AND workflow_instance_id = ?';
-      params.push(filters.workflow_instance_id);
-    }
-    if (filters?.workflow_id) {
-      query += ' AND workflow_id = ?';
-      params.push(filters.workflow_id);
-    }
-    if (filters?.phase_id) {
-      query += ' AND phase_id = ?';
-      params.push(filters.phase_id);
-    }
-    if (filters?.attestation_status) {
-      query += ' AND attestation_status = ?';
-      params.push(filters.attestation_status);
-    }
-
-    query += ' ORDER BY created_at DESC';
-    const stmt = this.db.prepare(query);
-    const rows = stmt.all(...params);
-    return (rows as any[]).map(row => this.mapProofRecordRow(row));
-  }
-
-  updateProofAttestation(
-    proofId: string,
-    payload: {
-      attestation_status: ProofRecord['attestation_status'];
-      attestor_id?: string | null;
-      attestation_note?: string | null;
-      attested_at?: number | null;
-    }
-  ): ProofRecord | null {
-    const existing = this.getProofRecord(proofId);
-    if (!existing) {
-      return null;
-    }
-    const attestedAt = payload.attestation_status === 'pending'
-      ? null
-      : payload.attested_at ?? Date.now();
-    const attestorProvided = Object.prototype.hasOwnProperty.call(payload, 'attestor_id');
-    const noteProvided = Object.prototype.hasOwnProperty.call(payload, 'attestation_note');
-    return this.upsertProofRecord({
-      id: proofId,
-      attestation_status: payload.attestation_status,
-      attestor_id: attestorProvided ? (payload.attestor_id ?? null) : existing.attestor_id,
-      attestation_note: noteProvided ? (payload.attestation_note ?? null) : existing.attestation_note,
-      attested_at: attestedAt
-    });
-  }
-
-  private mapProofRecordRow(row: any): ProofRecord {
-    return {
-      id: row.id,
-      session_id: row.session_id ?? null,
-      workflow_id: row.workflow_id,
-      workflow_instance_id: row.workflow_instance_id,
-      phase_id: row.phase_id,
-      proof_type: row.proof_type,
-      task_id: row.task_id ?? null,
-      description: row.description ?? null,
-      evidence_uri: row.evidence_uri ?? null,
-      hash: row.hash ?? null,
-      acknowledgers: row.acknowledgers ? JSON.parse(row.acknowledgers) : null,
-      created_by: row.created_by ?? null,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      attestation_status: row.attestation_status ?? 'pending',
-      attestor_id: row.attestor_id ?? null,
-      attested_at: row.attested_at ?? null,
-      attestation_note: row.attestation_note ?? null,
-      metadata: row.metadata ? JSON.parse(row.metadata) : null
-    };
-  }
 
   close() {
     this.db.close();

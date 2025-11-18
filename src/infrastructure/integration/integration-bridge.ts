@@ -2,7 +2,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { TypedEventEmitter } from '../../core/events/emitter';
-import type { ProofRecord } from '../../core/types';
 
 interface IntegrationConfig {
   webhooks?: IntegrationWebhook[];
@@ -11,7 +10,7 @@ interface IntegrationConfig {
 interface IntegrationWebhook {
   id: string;
   name?: string;
-  event: 'workflow_event' | 'sentinel_event' | 'proof_attested';
+  event: 'workflow_event' | 'sentinel_event';
   url: string;
   headers?: Record<string, string>;
   enabled?: boolean;
@@ -27,9 +26,6 @@ export class IntegrationBridge implements vscode.Disposable {
   private fileWatcher: fs.FSWatcher | null = null;
   private subscribed = false;
   private templateTargets: IntegrationEventTarget[] = [];
-  private readonly proofHandler = (record: ProofRecord) => {
-    void this.dispatch('proof_attested', record);
-  };
 
   constructor(
     private readonly workspaceRoot: string,
@@ -165,7 +161,7 @@ export class IntegrationBridge implements vscode.Disposable {
     if (this.subscribed) {
       return;
     }
-    this.events.on('proof_attested', this.proofHandler);
+    // No event subscriptions needed currently
     this.subscribed = true;
     this.output.appendLine('[Integration] Event subscriptions activated');
   }
@@ -174,7 +170,7 @@ export class IntegrationBridge implements vscode.Disposable {
     if (!this.subscribed) {
       return;
     }
-    this.events.off('proof_attested', this.proofHandler);
+    // No event subscriptions to remove
     this.subscribed = false;
     this.output.appendLine('[Integration] Event subscriptions paused (no active webhooks)');
   }

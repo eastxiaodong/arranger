@@ -65,6 +65,7 @@ export class StateStore {
     this.aceStates.clear();
     this.toolRuns = [];
     this.initialized = false;
+    this.events.emit('state:all_cleared', null as any);
   }
 
   private reloadAll() {
@@ -122,6 +123,8 @@ export class StateStore {
     switch (status) {
       case 'running':
         return 'active';
+      case 'needs-confirm':
+        return 'needs-confirm';
       case 'completed':
         return 'done';
       case 'failed':
@@ -194,6 +197,29 @@ export class StateStore {
     }
 
     if (taskState.state === newState) {
+      return taskState;
+    }
+
+    const allowedTransitions = new Set<string>([
+      'pending->active',
+      'pending->blocked',
+      'active->blocked',
+      'active->needs-confirm',
+      'active->finalizing',
+      'active->failed',
+      'blocked->reassigning',
+      'blocked->active',
+      'needs-confirm->active',
+      'needs-confirm->blocked',
+      'reassigning->active',
+      'reassigning->blocked',
+      'finalizing->done',
+      'failed->reassigning',
+      'failed->blocked'
+    ]);
+    const transitionKey = `${taskState.state}->${newState}`;
+    if (!allowedTransitions.has(transitionKey)) {
+      console.warn(`[StateStore] 拒绝非法状态转移：${transitionKey}，reason=${reason}, by=${triggeredBy}`);
       return taskState;
     }
 
@@ -416,7 +442,10 @@ export class StateStore {
   }
 
   createToolRun(run: Parameters<DatabaseManager['createToolRun']>[0]): ToolRun {
-    const record = this.db.createToolRun(run);
+    const record = this.db.createToolRun({
+      ...run,
+      session_id: run.session_id ?? 'global'
+    });
     this.upsertToolRunCache(record);
     this.events.emit('state:tool_run_created', record);
     this.emitToolRunsUpdate(run.session_id ?? null);

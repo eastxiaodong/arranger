@@ -12,7 +12,6 @@ import type {
   ThinkingLog,
   Session,
   TaskMetrics,
-  ProofRecord,
   TaskBacklogSummary,
   ToolRun,
   ManagerLLMConfig
@@ -49,8 +48,6 @@ export interface EventMap {
     error?: string | null;
     toolCount?: number | null;
   };
-  'proof_records_update': ProofRecord[];
-  'proof_attested': ProofRecord;
   'message_posted': BlackboardEntry;
   'task_completed': Task;
   'tool_runs_update': ToolRun[];

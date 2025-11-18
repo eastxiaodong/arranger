@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-  <title>Minimal Test</title>
+  <title>Arranger 面板</title>
   <style>
     * {
       margin: 0;
@@ -2073,6 +2073,7 @@
       font-size: 10px;
       font-weight: 500;
       line-height: 1.2;
+      white-space: nowrap;
     }
 
     .badge-default {
@@ -2088,6 +2089,11 @@
     .badge-warning {
       background-color: rgba(255, 152, 0, 0.2);
       color: #ff9800;
+    }
+
+    .badge-success {
+      background-color: var(--vscode-testing-iconPassed);
+      color: var(--vscode-editor-background);
     }
 
     .badge-error {
@@ -2338,6 +2344,20 @@
 
     .task-body {
       margin-top: 8px;
+    }
+
+    .task-sub-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .task-inline-action {
+      margin-left: auto;
+      white-space: nowrap;
+      padding: 2px 6px;
+      font-size: 12px;
     }
 
     .task-description {
@@ -3680,35 +3700,6 @@
     }
 
     /* Badge 样式 */
-    .badge {
-      display: inline-block;
-      padding: 2px 6px;
-      border-radius: 2px;
-      font-size: 10px;
-      font-weight: 600;
-      white-space: nowrap;
-    }
-
-    .badge-info {
-      background-color: var(--vscode-debugConsole-infoForeground);
-      color: var(--vscode-editor-background);
-    }
-
-    .badge-warning {
-      background-color: var(--vscode-inputValidation-warningBorder);
-      color: var(--vscode-editor-background);
-    }
-
-    .badge-success {
-      background-color: var(--vscode-testing-iconPassed);
-      color: var(--vscode-editor-background);
-    }
-
-    .badge-error {
-      background-color: var(--vscode-errorForeground);
-      color: var(--vscode-editor-background);
-    }
-
     .link-button:hover {
       text-decoration: underline;
     }
@@ -4584,7 +4575,6 @@
             <option value="">加载中...</option>
           </select>
           <span id="blackboard-current-session" class="session-current-label">--</span>
-          <span id="blackboard-session-scenario" class="session-scenario-label">场景：--</span>
           <button class="session-action-btn" data-action="openCreateSessionModal" title="新建会话">＋</button>
           <button class="session-action-btn danger" data-action="openDeleteSessionModal" title="删除当前会话">🗑</button>
         </div>
@@ -4638,19 +4628,13 @@
               <!-- Text Input -->
               <div class="message-textarea-wrapper" id="message-textarea-wrapper">
                 <textarea id="message-input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"></textarea>
-                <button onclick="sendMessage()"
+                <button id="message-send-btn" onclick="sendMessage()"
                   style="position: absolute; bottom: 8px; right: 8px; padding: 6px; width: 32px; height: 32px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 2px; cursor: pointer; display: flex; align-items: center; justify-content: center;">
                   <svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"
                     fill="currentColor">
                     <path d="M1 2L15 8L1 14V9L11 8L1 7V2Z" />
                   </svg>
                 </button>
-              </div>
-              <!-- Hint Text -->
-              <div
-                style="display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--vscode-descriptionForeground); padding-top: 4px;">
-                <span class="badge badge-info" style="font-size: 10px;">提示</span>
-                <span>你可以随时参与对话，提问、给建议、做决策</span>
               </div>
             </div>
           </div>
@@ -4794,7 +4778,7 @@
                 onclick="switchGlobalConfigTab('agents')">Agent 管理</button>
               <button class="global-config-tab" data-global-tab="mcp" onclick="switchGlobalConfigTab('mcp')">MCP
                 配置</button>
-              <button class="global-config-tab" data-global-tab="ace" onclick="switchGlobalConfigTab('ace')">ACE
+              <button class="global-config-tab" data-global-tab="ace" onclick="switchGlobalConfigTab('ace')">ACE 集成
                 集成</button>
               <button class="global-config-tab" data-global-tab="manager-llm"
                 onclick="switchGlobalConfigTab('manager-llm')">经理 LLM</button>
@@ -5303,6 +5287,22 @@
     </div>
   </div>
 
+  <!-- 模态弹窗：任务详情 -->
+  <div class="modal-overlay" id="modal-task-detail">
+    <div class="modal-container">
+      <div class="modal-header">
+        <h3 class="modal-title" id="task-detail-title">任务详情</h3>
+        <button class="modal-close-btn" data-action="closeModal">×</button>
+      </div>
+      <div class="modal-body" id="task-detail-body">
+        <div class="empty-state">暂无任务信息</div>
+      </div>
+      <div class="modal-footer" style="justify-content: flex-end;">
+        <button class="btn btn-secondary" data-action="closeModal">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 模态弹窗：MCP 配置 -->
   <div class="modal-overlay" id="modal-mcp-config">
     <div class="modal-container">
@@ -5474,7 +5474,7 @@
         return map;
       }, {});
 
-      const WORKFLOW_PERSONA_LABELS = {
+      const PERSONA_LABELS = {
         lead: '主持',
         reviewer: '评审',
         executor: '执行',
@@ -5578,24 +5578,6 @@
         });
       }
 
-      function getSelectedToolPermissions(form) {
-        const chips = form?.querySelectorAll('#agent-tools-cloud .tag-chip.selected');
-        return chips ? Array.from(chips).map(chip => chip.dataset.tool) : [];
-      }
-
-      function setSelectedToolPermissions(form, permissions) {
-        const permissionSet = new Set(permissions || []);
-        const chips = form?.querySelectorAll('#agent-tools-cloud .tag-chip') || [];
-        chips.forEach(chip => {
-          const tool = chip.dataset.tool;
-          if (permissionSet.has(tool)) {
-            chip.classList.add('selected');
-          } else {
-            chip.classList.remove('selected');
-          }
-        });
-      }
-
       function getStatusText(status) {
         const normalized = (status || 'offline').toLowerCase();
         const map = {
@@ -5617,7 +5599,7 @@
         if (message.visibility) {
           return message.visibility;
         }
-        if ((message.agent_id || '').toLowerCase() === 'workflow_orchestrator' || message.message_type === 'system') {
+        if ((message.agent_id || '').toLowerCase() === 'system') {
           return 'event_log';
         }
         return 'blackboard';
@@ -5631,7 +5613,7 @@
         if (agentId === 'user' || agentId.startsWith('human')) {
           return 'user';
         }
-        if (message?.message_type === 'system') {
+        if (agentId === 'system') {
           return 'system_event';
         }
         return 'agent_summary';
@@ -5644,16 +5626,8 @@
         if (message.priority === 'high') {
           return 'critical';
         }
-        switch (message.message_type) {
-          case 'warning':
-            return 'warning';
-          case 'decision':
-            return 'success';
-          case 'question':
-            return 'info';
-          default:
-            return 'info';
-        }
+        // 默认返回 info，优先级已经在上面处理
+        return 'info';
       }
 
       function buildEventMetaPartsFromMessage(message) {
@@ -5684,7 +5658,7 @@
         if (normalized === 'user' || normalized === 'customer') {
           return '用户';
         }
-        if (normalized === 'system' || normalized === 'workflow_orchestrator') {
+        if (normalized === 'system') {
           return '系统';
         }
         const agent = allAgents.find(a => a.id === agentId);
@@ -5714,15 +5688,11 @@
           return null;
         }
         const agentId = (message.agent_id || '').toLowerCase();
-        if (agentId === 'workflow_orchestrator' || agentId === 'system') {
-          return { key: 'moderator', label: WORKFLOW_PERSONA_LABELS.moderator };
+        if (agentId === 'system') {
+          return { key: 'moderator', label: PERSONA_LABELS.moderator };
         }
         if (agentId === 'user' || agentId === 'customer') {
-          return { key: 'user', label: WORKFLOW_PERSONA_LABELS.user };
-        }
-        const payloadPersona = message.payload?.workflow_role_persona || message.payload?.workflow_persona;
-        if (payloadPersona && WORKFLOW_PERSONA_LABELS[payloadPersona]) {
-          return { key: payloadPersona, label: WORKFLOW_PERSONA_LABELS[payloadPersona] };
+          return { key: 'user', label: PERSONA_LABELS.user };
         }
         const references = parseMessageReferences(message.references || message);
         const taskRef = references.find(ref => ref.type === 'task');
@@ -5793,8 +5763,6 @@
             return '任务';
           case 'file':
             return '文件';
-          case 'proof':
-            return 'Proof';
           case 'message':
             return '消息';
           default:
@@ -5890,13 +5858,6 @@
         return allFileChanges.find(change => String(change.id) === String(changeId)) || null;
       }
 
-      function getProofRecordById(proofId) {
-        if (!proofId) {
-          return null;
-        }
-        return null;
-      }
-
       function getPhaseTitle(phaseId) {
         return phaseId || '未知阶段';
       }
@@ -5945,16 +5906,6 @@
             id: ref.id,
             title: change.file_path || `变更 ${change.id}`,
             subtitle: summary
-          };
-        }
-        if (ref.type === 'proof') {
-          const record = getProofRecordById(ref.id);
-          return {
-            token,
-            type: ref.type,
-            id: ref.id,
-            title: record?.description || `Proof ${ref.id}`,
-            subtitle: record?.phase_id ? `阶段：${getPhaseTitle(record.phase_id)}` : '记录不可用'
           };
         }
         if (ref.type === 'message') {
@@ -6137,7 +6088,7 @@
             <div class="task-progress-meter"><span style="width:${summary.total ? Math.min(100, Math.round((summary.completed / summary.total) * 100)) : 0}%"></span></div>
             <div class="task-progress-meta">剩余 ${remaining}${blockedLabel}</div>
             <div class="task-progress-actions">
-              <button data-action="focusBacklogSummary" data-summary-id="${summary.id}">查看任务</button>
+              <button data-action="focusBacklogSummary" data-summary-id="${summary.id}">详情</button>
             </div>
           </div>
         `;
@@ -6788,6 +6739,19 @@
         prefix: '',
         hideTimer: null
       };
+      function extractMentionsFromText(text) {
+        if (!text) return [];
+        const matches = text.match(/@([a-zA-Z0-9._\\-]+)/g);
+        if (!matches) return [];
+        const uniq = new Set();
+        matches.forEach(m => {
+          const id = m.slice(1).trim();
+          if (id) {
+            uniq.add(id);
+          }
+        });
+        return Array.from(uniq);
+      }
       function renderTasks(tasks) {
         allTasks = Array.isArray(tasks) ? tasks : [];
         sessionTasks = currentSessionId ? allTasks.filter(t => t.session_id === currentSessionId) : allTasks;
@@ -6824,7 +6788,7 @@
       function getWorkspaceMessages() {
         if (!currentSessionId || !selectedAgentId) return [];
         const messages = Array.isArray(allMessages) ? allMessages : [];
-        return messages
+        const base = messages
           .filter(m => m.session_id === currentSessionId)
           .filter(m => m.agent_id === selectedAgentId || (Array.isArray(m.mentions) && m.mentions.includes(selectedAgentId)))
           .map(m => ({
@@ -6836,6 +6800,23 @@
             priority: m.priority,
             source: m.agent_id === selectedAgentId ? 'agent' : 'external'
           }));
+
+        // 补充与当前 Agent 相关的指派任务提示
+        const tasks = Array.isArray(allTasks) ? allTasks : [];
+        const taskHints = tasks
+          .filter(t => t.session_id === currentSessionId && t.assigned_to === selectedAgentId)
+          .slice(0, 30)
+          .map(t => ({
+            type: 'message',
+            id: `task_hint_${t.id}`,
+            ts: t.updated_at || t.created_at || Date.now(),
+            actor: 'system',
+            content: `任务指派：${t.title || t.id}（${getTaskStatusLabel(t.status)}）`,
+            priority: t.priority || 'medium',
+            source: 'external'
+          }));
+
+        return [...base, ...taskHints];
       }
 
       function getWorkspaceThinking() {
@@ -6855,7 +6836,7 @@
       function getWorkspaceTools() {
         if (!currentSessionId || !selectedAgentId) return [];
         return (allToolRuns || [])
-          .filter(run => run.session_id === currentSessionId && run.agent_id === selectedAgentId)
+          .filter(run => run.session_id === currentSessionId && (run.created_by === selectedAgentId || run.agent_id === selectedAgentId))
           .map(run => ({
             type: 'tool',
             id: run.id || `tool-${run.created_at || Date.now()}`,
@@ -7079,9 +7060,6 @@
           const capabilities = agent.capabilities && agent.capabilities.length
             ? agent.capabilities.map(cap => escapeHtml(getCapabilityText(cap))).join('、')
             : '未配置';
-          const toolPermissions = agent.tool_permissions && agent.tool_permissions.length
-            ? agent.tool_permissions.map(tool => escapeHtml(getToolPermissionText(tool))).join('、')
-            : '未授权';
           const metrics = agent.metrics || null;
           const successRate = typeof metrics?.success_rate === 'number'
             ? Math.round(Math.max(0, Math.min(1, metrics.success_rate)) * 100)
@@ -7124,18 +7102,14 @@
               </div>
               ${statusDetail ? `<div class="global-agent-meta">${statusDetail}</div>` : ''}
               <div class="agent-card-body">
-                <div class="agent-card-section">
-                  <div class="agent-card-section-title">能力</div>
-                  <div>${capabilities}</div>
-                </div>
-                <div class="agent-card-section">
-                  <div class="agent-card-section-title">工具权限</div>
-                  <div>${toolPermissions}</div>
-                </div>
-                <div class="agent-card-section">
-                  <div class="agent-card-section-title">LLM 配置</div>
-                  <div>${llmText}</div>
-                </div>
+              <div class="agent-card-section">
+                <div class="agent-card-section-title">能力</div>
+                <div>${capabilities}</div>
+              </div>
+              <div class="agent-card-section">
+                <div class="agent-card-section-title">LLM 配置</div>
+                <div>${llmText}</div>
+              </div>
                 <div class="agent-card-section">
                   <div class="agent-card-section-title">运行指标</div>
                   <div>${metricsText}</div>
@@ -7193,14 +7167,17 @@
         const metaLine = task.dependencies?.length ? `<div class="task-meta">依赖：${task.dependencies.length} 个</div>` : '';
 
         return `
-        <div class="task-card ${statusClass}">
+        <div class="task-card ${statusClass}" data-task-id="${escapeHtml(task.id)}">
           <div class="task-header">
-            <span class="task-state">${escapeHtml(task.status || 'pending')}</span>
+            <span class="task-state">${escapeHtml(getTaskStatusLabel(task.status))}</span>
             <span class="task-time">${created}</span>
           </div>
           <div class="task-body">
             <div class="task-title">${escapeHtml(task.title || '任务')} ${typeBadge}</div>
-            <div class="task-sub">${assignedText}</div>
+            <div class="task-sub-row">
+              <div class="task-sub">${assignedText}</div>
+              <button class="link-button task-inline-action" data-action="openTaskDetailModal" data-task-id="${escapeHtml(task.id)}">详情</button>
+            </div>
             ${metaLine}
           </div>
         </div>
@@ -7315,10 +7292,16 @@
 
       function formatPriorityLabel(priority) {
         if (!priority) {
-          return PRIORITY_LABELS.medium;
+          return '中';
         }
+        const map = {
+          high: '高',
+          medium: '中',
+          low: '低',
+          critical: '紧急'
+        };
         const normalized = String(priority).toLowerCase();
-        return PRIORITY_LABELS[normalized] || priority.toString().toUpperCase();
+        return map[normalized] || priority.toString();
       }
 
       function formatPriorityClass(priority) {
@@ -7474,6 +7457,12 @@
       if (messageInputEl) {
         messageInputEl.addEventListener('input', handleMessageInputChange);
         messageInputEl.addEventListener('blur', handleMessageInputChange);
+        messageInputEl.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            sendMessage();
+          }
+        });
       }
 
       function renderBlackboardSessions(sessions) {
@@ -7776,8 +7765,6 @@
         switch (type) {
           case 'phase_timeout':
             return '阶段运行超时';
-          case 'proof_missing':
-            return '缺少证据';
           case 'task_stalled':
             return '任务超时';
           case 'defect_loop':
@@ -7847,7 +7834,7 @@
       }
 
       function formatPersonaLabel(persona, role) {
-        const base = WORKFLOW_PERSONA_LABELS[persona] || persona;
+        const base = PERSONA_LABELS[persona] || persona;
         if (!role) {
           return base;
         }
@@ -7905,13 +7892,6 @@
           const numeric = Number(id);
           if (!Number.isNaN(numeric)) {
             window.toggleFileChangeDetail(numeric);
-          }
-          return;
-        }
-        if (type === 'proof') {
-          window.switchBlackboardView('workflow');
-          if (proofList) {
-            proofList.scrollIntoView({ behavior: 'smooth', block: 'start' });
           }
           return;
         }
@@ -8417,12 +8397,66 @@
           return;
         }
         console.log('[MinimalPanel] Task detail requested:', taskId);
-        vscode.postMessage({ type: 'show_info', message: `任务 ${taskId}: ${task.title || '查看详情'}` });
+        renderTaskDetailModal(task);
+        openModal('modal-task-detail');
       };
 
       window.openTaskDependencyModal = function (taskId) {
         window.openTaskDetailModal(taskId);
       };
+      function renderTaskDetailModal(task) {
+        const titleEl = document.getElementById('task-detail-title');
+        const bodyEl = document.getElementById('task-detail-body');
+        if (titleEl) {
+          titleEl.textContent = task.title || `任务 ${task.id}`;
+        }
+        if (!bodyEl) {
+          return;
+        }
+        const status = getTaskStatusLabel(task.status);
+        const priority = formatPriorityLabel(task.priority);
+        const assignee = task.assigned_to || '未指派';
+        const created = task.created_at ? formatTime(task.created_at) : '';
+        const deps = Array.isArray(task.dependencies) && task.dependencies.length
+          ? task.dependencies.map(id => `<span class="badge badge-secondary">#${escapeHtml(id)}</span>`).join(' ')
+          : '无';
+        const labels = Array.isArray(task.labels) && task.labels.length
+          ? task.labels.map(l => `<span class="badge badge-info">${escapeHtml(l)}</span>`).join(' ')
+          : '无';
+        const scope = task.scope || 'workspace';
+        bodyEl.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:12px;">
+            <div class="task-detail-section">
+              <div class="task-detail-title">${escapeHtml(task.title || '任务')}</div>
+              <div class="task-detail-subtitle">${escapeHtml(task.intent || '')}</div>
+              <div class="task-detail-badges">
+                <span class="badge badge-secondary">状态：${escapeHtml(status)}</span>
+                <span class="badge badge-secondary">优先级：${escapeHtml(priority)}</span>
+                <span class="badge badge-secondary">指派：${escapeHtml(assignee)}</span>
+                <span class="badge badge-secondary">范围：${escapeHtml(scope)}</span>
+              </div>
+              <div class="task-detail-meta-grid">
+                <div class="task-detail-meta-item">
+                  <div class="label">创建时间</div>
+                  <div class="value">${escapeHtml(created || '—')}</div>
+                </div>
+                <div class="task-detail-meta-item">
+                  <div class="label">依赖</div>
+                  <div class="value">${deps}</div>
+                </div>
+                <div class="task-detail-meta-item">
+                  <div class="label">标签</div>
+                  <div class="value">${labels}</div>
+                </div>
+              </div>
+            </div>
+            <div class="task-detail-section">
+              <div class="task-detail-label">描述</div>
+              <div class="task-detail-desc">${escapeHtml(task.description || '暂无描述')}</div>
+            </div>
+          </div>
+        `;
+      }
 
       window.pauseTask = function (taskId) {
         if (!taskId) {
@@ -8543,6 +8577,10 @@
           priority: 'normal',
           session_id: currentSessionId
         };
+        const mentions = extractMentionsFromText(content);
+        if (mentions.length) {
+          messageData.mentions = mentions;
+        }
 
         if (replyToMessage) {
           messageData.reply_to = replyToMessage.id;
@@ -9078,6 +9116,16 @@
         if (run.output?.stderr) {
           fragments.push('stderr:\n' + escapeHtml(run.output.stderr));
         }
+        if (run.output && typeof run.output === 'object') {
+          const cloned = { ...run.output };
+          delete cloned.stdout;
+          delete cloned.stderr;
+          if (Object.keys(cloned).length) {
+            fragments.push('输出:\n' + escapeHtml(JSON.stringify(cloned, null, 2)));
+          }
+        } else if (typeof run.output === 'string' && run.output.trim()) {
+          fragments.push('输出:\n' + escapeHtml(run.output));
+        }
         if (run.error) {
           fragments.push('error:\n' + escapeHtml(run.error));
         }
@@ -9098,9 +9146,12 @@
         const statusText = formatToolRunStatus(run.status);
         const started = run.started_at ? formatTime(run.started_at) : '—';
         const duration = formatToolRunDuration(run);
+        const owner = run.agent_id || run.created_by || '未知';
+        const ownerName = getAgentName(owner);
         const logId = `tool-log-${run.id}`;
         const command = run.command || (run.input?.command) || '—';
         const taskId = run.task_id || '—';
+        const sessionTag = run.session_id ? `会话：${escapeHtml(run.session_id)}` : '会话：全局';
         const showRetry = run.status === 'failed';
         const instanceLabel = ''; // 实例标签（预留）
         return `
@@ -9109,6 +9160,8 @@
               <div>
                 <span class="tool-run-name">${escapeHtml(run.tool_name || '工具')}</span>
                 <span class="tool-run-meta">${statusText}</span>
+                <span class="tool-run-meta">发起：${escapeHtml(ownerName)}</span>
+                <span class="tool-run-meta">${sessionTag}</span>
                 ${instanceLabel}
               </div>
               <div class="tool-run-actions">
@@ -9137,7 +9190,8 @@
           if (!currentSessionId) {
             return true;
           }
-          return (run.session_id || null) === currentSessionId;
+          // 当前会话或全局 ACE 运行都展示
+          return (run.session_id || null) === currentSessionId || run.runner === 'ace';
         });
         const filtered = runs.filter(run => toolRunStatusFilter === 'all' ? true : run.status === toolRunStatusFilter);
         if (stats) {
@@ -10632,12 +10686,6 @@
           });
         });
 
-        // 工具权限标签点击事件
-        document.querySelectorAll('#agent-tools-cloud .tag-chip').forEach(chip => {
-          chip.addEventListener('click', function () {
-            this.classList.toggle('selected');
-          });
-        });
       }
 
       window.addCustomCapability = function () {
@@ -10994,20 +11042,6 @@
           const target = e.target;
           if (!target || !(target instanceof HTMLElement)) {
             return;
-          }
-
-          // 处理任务卡片点击
-          const taskItem = target.closest('.task-item');
-          if (taskItem && !target.closest('[data-action]') && !target.closest('button')) {
-            const taskId = taskItem.getAttribute('data-task-id');
-            if (taskId && typeof window.openTaskDetailModal === 'function') {
-              try {
-                window.openTaskDetailModal(taskId);
-              } catch (error) {
-                console.error('[MinimalPanel] Error opening task detail modal:', error);
-              }
-              return;
-            }
           }
 
           // 获取 data-action 元素

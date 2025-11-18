@@ -93,20 +93,17 @@ export function createServices(options: ServiceFactoryOptions): ServiceFactoryRe
 
   const stateStore = new StateStore(db, events);
   stateStore.initialize();
-  const agentService = new AgentService(globalConfigDb, db, events);
+  const agentService = new AgentService(globalConfigDb, db, events, stateStore);
   const notificationService = new NotificationService(db, events);
   const messageService = new MessageService(db, events);
-  const taskService = new TaskService(db, events, stateStore, agentService, notificationService);
-  const assistService = new AssistService(stateStore, messageService, taskService, notificationService);
   const taskContextService = new TaskContextService(messageService);
   const mcpServerService = new MCPServerService(globalConfigDb, events);
   const mcpService = new MCPService(mcpServerService, events, outputChannel);
   const managerLLMService = new ManagerLLMService(globalConfigDb, events);
-
   const services: Services = {
     agent: agentService,
-    task: taskService,
-    assist: assistService,
+    task: {} as TaskService,
+    assist: {} as AssistService,
     message: messageService,
     policy: new PolicyService(globalConfigDb, events),
     notification: notificationService,
@@ -132,6 +129,12 @@ export function createServices(options: ServiceFactoryOptions): ServiceFactoryRe
   services.mcp.setToolRunRecorder(toolExecutionService);
   const recordAceRun = createAceRunRecorder(toolExecutionService, stateStore, workspaceRoot);
   services.aceContext = new AceContextService(globalConfigDb, workspaceRoot, outputChannel, recordAceRun);
+
+  const taskService = new TaskService(db, events, stateStore, agentService, services.aceContext, notificationService, messageService);
+  services.task = taskService;
+  const assistService = new AssistService(stateStore, messageService, taskService, notificationService);
+  services.assist = assistService;
+
   const automationService = new AutomationService({
     ace: services.aceContext,
     tools: toolExecutionService,
@@ -161,8 +164,17 @@ export function createServices(options: ServiceFactoryOptions): ServiceFactoryRe
   const schedulerService = new SchedulerService(agentService, taskService, stateStore, events, outputChannel);
   services.scheduler = schedulerService;
 
-  const failoverService = new FailoverService(agentService, taskService, stateStore, events, outputChannel);
+  const failoverService = new FailoverService(
+    agentService,
+    taskService,
+    stateStore,
+    events,
+    outputChannel,
+    notificationService,
+    messageService
+  );
   services.failover = failoverService;
+  failoverService.start();
 
   return {
     services,
@@ -201,6 +213,7 @@ function createAceRunRecorder(
     if (run.stage === 'start') {
       toolExecutionService.recordExternalRunStart({
         id: run.runId,
+        agent_id: 'ace',
         tool_name: `ace:${run.type}`,
         runner: 'ace',
         source: 'ace',

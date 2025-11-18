@@ -47,6 +47,7 @@ export class ToolExecutionService implements vscode.Disposable {
   private disposed = false;
   private readonly runningTasks = new Set<string>();
   private readonly state: Services['state'];
+  private readonly runMessageMap = new Map<string, { sessionId: string | null; taskId: string | null; agentId: string | null; messageId: string }>();
 
   constructor(
     private readonly events: TypedEventEmitter,
@@ -75,10 +76,24 @@ export class ToolExecutionService implements vscode.Disposable {
     this.disposed = true;
   }
 
+  private resolveSessionId(sessionId?: string | null, taskId?: string | null): string | null {
+    if (sessionId) {
+      return sessionId;
+    }
+    if (taskId) {
+      const task = this.services.task.getTask(taskId);
+      if (task?.session_id) {
+        return task.session_id;
+      }
+    }
+    return null;
+  }
+
   recordExternalRunStart(run: {
     id: string;
     session_id?: string | null;
     task_id?: string | null;
+    agent_id?: string | null;
     workflow_instance_id?: string | null;
     tool_name: string;
     runner?: string;
@@ -87,9 +102,10 @@ export class ToolExecutionService implements vscode.Disposable {
     input?: Record<string, any> | null;
     created_by?: string | null;
   }): ToolRun {
+    const sessionId = this.resolveSessionId(run.session_id, run.task_id) ?? 'global';
     const record = this.state.createToolRun({
       id: run.id,
-      session_id: run.session_id ?? null,
+      session_id: sessionId,
       task_id: run.task_id ?? null,
       workflow_instance_id: run.workflow_instance_id ?? null,
       tool_name: run.tool_name,
@@ -102,10 +118,11 @@ export class ToolExecutionService implements vscode.Disposable {
       exit_code: null,
       error: null,
       started_at: Date.now(),
-      created_by: run.created_by ?? null,
+      created_by: run.created_by ?? run.agent_id ?? null,
       metadata: null,
       completed_at: null
     });
+    this.maybeCreateRunMessage(record);
     return record;
   }
 
@@ -122,6 +139,9 @@ export class ToolExecutionService implements vscode.Disposable {
       error: result.error ?? null,
       completed_at: Date.now()
     });
+    if (updated) {
+      this.maybeUpdateRunMessage(updated);
+    }
     return updated;
   }
 
@@ -220,6 +240,7 @@ export class ToolExecutionService implements vscode.Disposable {
       started_at: Date.now(),
       created_by: automation.created_by || 'workflow'
     });
+    this.maybeCreateRunMessage(runRecord);
     this.updateTaskAutomationMetadata(task, { last_run_id: runRecord.id, last_run_status: 'running' });
 
     try {
@@ -268,6 +289,75 @@ export class ToolExecutionService implements vscode.Disposable {
     } finally {
       this.runningTasks.delete(task.id);
     }
+  }
+
+  private buildRunMessageContent(run: ToolRun, statusOverride?: ToolRun['status']): string {
+    const status = statusOverride || run.status || 'running';
+    const statusText = status === 'succeeded' ? '成功' : status === 'failed' ? '失败' : '进行中';
+    const title = run.tool_name ? `工具 ${run.tool_name}` : '工具运行';
+    const errorLine = run.error ? `\n错误：${run.error}` : '';
+    let resultLine = '';
+    if (run.output && typeof run.output === 'object') {
+      const msg = (run.output as any).message || (run.output as any).summary || '';
+      if (msg) {
+        resultLine = `\n结果：${msg}`;
+      }
+    } else {
+      const outputValue: any = (run as any).output;
+      if (typeof outputValue === 'string') {
+        const trimmed = outputValue.trim();
+        if (trimmed) {
+          resultLine = `\n结果：${trimmed}`;
+        }
+      }
+    }
+    const taskLine = run.task_id ? `\n任务：${run.task_id}` : '';
+    return `${title}（${statusText}）${taskLine}${errorLine || resultLine}`;
+  }
+
+  private maybeCreateRunMessage(run: ToolRun): void {
+    if (!run.session_id) {
+      return;
+    }
+    const content = this.buildRunMessageContent(run, 'running');
+    const references = run.task_id ? [`task:${run.task_id}`] : null;
+    const message = this.services.message.sendMessage({
+      id: `tool_msg_${run.id}`,
+      session_id: run.session_id,
+      agent_id: run.created_by || 'workflow_orchestrator',
+      content,
+      priority: 'medium',
+      tags: ['tool_run'],
+      reply_to: null,
+      references,
+      reference_type: run.task_id ? 'task' : null,
+      reference_id: run.task_id || null,
+      mentions: run.created_by ? [run.created_by] : null,
+      expires_at: null,
+      category: 'agent_summary',
+      visibility: 'blackboard',
+      payload: { tool_run_id: run.id, status: 'running' }
+    });
+    this.runMessageMap.set(run.id, {
+      sessionId: run.session_id,
+      taskId: run.task_id,
+      agentId: run.created_by || null,
+      messageId: message.id
+    });
+  }
+
+  private maybeUpdateRunMessage(run: ToolRun): void {
+    const meta = this.runMessageMap.get(run.id);
+    if (!meta || !meta.sessionId) {
+      return;
+    }
+    const messageId = meta.messageId;
+    const payload: Record<string, any> = { tool_run_id: run.id, status: run.status };
+    const content = this.buildRunMessageContent(run);
+    this.services.message.updateMessage(messageId, {
+      content,
+      payload
+    });
   }
 
   private async handleAutomationSuccess(
@@ -441,7 +531,10 @@ export class ToolExecutionService implements vscode.Disposable {
     created_by?: string | null;
     confirmed?: boolean;
   }): Promise<ToolRun> {
-    this.enforceSensitiveGuard(run);
+    const guardError = this.checkSensitiveGuard(run);
+    if (guardError) {
+      throw guardError;
+    }
     const runId = run.id ?? `toolrun_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const cwd = run.cwd
       ? path.isAbsolute(run.cwd) ? run.cwd : path.join(this.workspaceRoot, run.cwd)
@@ -505,33 +598,61 @@ export class ToolExecutionService implements vscode.Disposable {
     created_by?: string | null;
   }): Promise<any> {
     const { server_id, tool, args = {}, session_id = null, task_id = null, created_by = 'system' } = params;
-    const result = await this.services.mcp.callToolById(server_id, tool, args, {
+    const runId = `toolrun_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const runRecord = this.state.createToolRun({
+      id: runId,
       session_id,
       task_id,
-      created_by
+      workflow_instance_id: null,
+      tool_name: `mcp:${tool}`,
+      runner: 'mcp',
+      source: 'mcp',
+      command: tool,
+      input: { server_id, args },
+      output: null,
+      status: 'running',
+      exit_code: null,
+      error: null,
+      started_at: Date.now(),
+      created_by: created_by || 'system',
+      metadata: { server_id }
     });
-    this.services.message?.sendMessage({
-      id: `mcp_msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      session_id: session_id || '',
-      agent_id: created_by || 'system',
-      content: `已触发 MCP 工具 ${tool}（server ${server_id}）`,
-      priority: 'medium',
-      tags: ['mcp', 'tool'],
-      reply_to: null,
-      references: task_id ? [task_id] : null,
-      reference_type: task_id ? 'task' : null,
-      reference_id: task_id,
-      mentions: null,
-      expires_at: null,
-      category: 'system_event',
-      visibility: 'blackboard',
-      payload: {
-        server_id,
-        tool,
-        result_preview: typeof result === 'string' ? result.slice(0, 200) : undefined
+    this.maybeCreateRunMessage(runRecord);
+
+    try {
+      const result = await this.services.mcp.callToolById(server_id, tool, args, {
+        session_id,
+        task_id,
+        created_by
+      });
+      const updated = this.state.updateToolRun(runRecord.id, {
+        status: 'succeeded',
+        output: { result },
+        completed_at: Date.now()
+      });
+      if (updated) {
+        this.maybeUpdateRunMessage(updated);
       }
-    });
-    return result;
+      return result;
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      const updated = this.state.updateToolRun(runRecord.id, {
+        status: 'failed',
+        error: message,
+        completed_at: Date.now()
+      });
+      if (updated) {
+        this.maybeUpdateRunMessage(updated);
+      }
+      this.services.notification?.sendNotification({
+        session_id: session_id || 'global',
+        level: 'warning',
+        title: 'MCP 工具执行失败',
+        message: `调用 ${tool} 失败：${message}`,
+        metadata: { tool, server_id, run_id: runRecord.id, task_id }
+      });
+      throw error;
+    }
   }
 
   /**
@@ -552,9 +673,10 @@ export class ToolExecutionService implements vscode.Disposable {
     confirmed?: boolean;
   }): ToolRun {
     const runId = run.id ?? `toolrun_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const sessionId = this.resolveSessionId(run.session_id ?? null, run.task_id ?? null) ?? 'global';
     const record = this.state.createToolRun({
       id: runId,
-      session_id: run.session_id ?? null,
+      session_id: sessionId,
       task_id: run.task_id ?? null,
       workflow_instance_id: null,
       tool_name: run.tool_name,
@@ -672,6 +794,84 @@ export class ToolExecutionService implements vscode.Disposable {
       
       // 如果是直接阻止的操作
       throw new Error(`命令包含敏感关键字：${log.matchedKeywords.join(', ')}，已被阻止执行。`);
+    }
+  }
+
+  private checkSensitiveGuard(run: {
+    command?: string;
+    tool_name: string;
+    session_id?: string | null;
+    task_id?: string | null;
+    runner?: string | null;
+    source?: string | null;
+    created_by?: string | null;
+    confirmed?: boolean;
+  }): Error | null {
+    try {
+      this.enforceSensitiveGuard(run);
+      return null;
+    } catch (error: any) {
+      const keywords = error?.sensitiveData?.matchedKeywords;
+      const riskLevel = error?.sensitiveData?.riskLevel;
+      const reason = error?.message || '命令被敏感策略拦截';
+      const sessionId = run.session_id || null;
+      const taskId = run.task_id || null;
+      if (taskId) {
+        this.services.task.transitionTaskStatus(taskId, 'blocked', reason, 'tool_guard');
+        this.state.transitionTaskState(taskId, 'needs-confirm', reason, 'tool_guard');
+        const task = this.services.task.getTask(taskId);
+        if (task) {
+          const meta = task.metadata && typeof task.metadata === 'object' ? { ...task.metadata } : {};
+          (meta as any).sensitive_pending = {
+            reason,
+            matched_keywords: keywords || [],
+            risk_level: riskLevel || 'unknown',
+            at: Date.now()
+          };
+          this.services.task.updateTask(taskId, { metadata: meta });
+        }
+      }
+      if (sessionId) {
+        this.services.message.sendMessage({
+          id: `sens_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          session_id: sessionId,
+          agent_id: run.created_by || 'workflow_orchestrator',
+          content: `⚠️ ${run.tool_name} 命令已被拦截：${reason}${keywords ? `（命中：${keywords.join(', ')}，风险：${riskLevel || '未知'}）` : ''}`,
+          priority: 'high',
+          tags: ['sensitive', 'tool_run'],
+          reply_to: null,
+          references: run.task_id ? [run.task_id] : null,
+          reference_type: run.task_id ? 'task' : null,
+          reference_id: run.task_id ?? null,
+          mentions: run.created_by ? [run.created_by] : null,
+          expires_at: null,
+          category: 'system_event',
+          visibility: 'blackboard',
+          payload: {
+            action: 'blocked',
+            risk_level: riskLevel || 'unknown',
+            matched_keywords: keywords || [],
+            tool_name: run.tool_name,
+            source: run.source || null,
+            runner: run.runner || null
+          }
+        });
+      }
+      this.services.notification?.sendNotification({
+        session_id: sessionId || 'global',
+        level: 'warning',
+        title: '敏感命令被拦截',
+        message: reason,
+        metadata: {
+          matched_keywords: keywords || [],
+          risk_level: riskLevel || 'unknown',
+          tool_name: run.tool_name,
+          command: run.command,
+          source: run.source || null,
+          runner: run.runner || null
+        }
+      });
+      return error instanceof Error ? error : new Error(reason);
     }
   }
 

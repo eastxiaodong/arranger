@@ -67,6 +67,33 @@ export class SchedulerService {
   }
 
   /**
+   * 尝试为任务选择最佳 Agent 并指派（无效则保持原状）
+   */
+  tryAssignBestAgent(task: TaskStateRecord): AgentScore | null {
+    const availableAgents = this.agentService.getOnlineLLMAgents();
+    if (!availableAgents.length) {
+      return null;
+    }
+    const healthMap = new Map<string, AgentHealthRecord>();
+    this.state.queryAgentHealth({}).forEach(h => healthMap.set(h.agentId, h));
+    const context: SchedulingContext = {
+      taskId: task.taskId,
+      taskState: task,
+      availableAgents,
+      agentHealthMap: healthMap
+    };
+    const best = this.selectBestAgent(context);
+    if (best) {
+      this.taskService.updateTask(task.taskId, {
+        assigned_to: best.agentId,
+        status: 'assigned'
+      });
+      this.events.emit('tasks_update', this.taskService.getAllTasks({}));
+    }
+    return best;
+  }
+
+  /**
    * 为任务选择最佳Agent
    */
   selectBestAgent(context: SchedulingContext): AgentScore | null {

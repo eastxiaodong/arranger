@@ -1108,8 +1108,9 @@ export class MinimalPanelProvider {
     if (sessions.length > 0) {
       return sessions[sessions.length - 1].id;
     }
-    const fallbackId = `session-${Date.now()}`;
+    const fallbackId = 'session-default';
     const session = this.services.session.createSession(fallbackId);
+    vscode.window.showInformationMessage(`已自动创建会话 ${fallbackId}，用于当前操作`);
     return session.id;
   }
 
