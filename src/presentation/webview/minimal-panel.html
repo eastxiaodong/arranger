@@ -6547,7 +6547,17 @@
       }
       const workspaceInputEl = document.getElementById('workspace-input');
       if (workspaceInputEl) {
+        let workspaceInputComposing = false;
+        workspaceInputEl.addEventListener('compositionstart', () => {
+          workspaceInputComposing = true;
+        });
+        workspaceInputEl.addEventListener('compositionend', () => {
+          workspaceInputComposing = false;
+        });
         workspaceInputEl.addEventListener('keydown', (e) => {
+          if (workspaceInputComposing || e.isComposing) {
+            return;
+          }
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             window.sendWorkspaceMessage();
@@ -7474,7 +7484,17 @@
       if (messageInputEl) {
         messageInputEl.addEventListener('input', handleMessageInputChange);
         messageInputEl.addEventListener('blur', handleMessageInputChange);
+        let messageInputComposing = false;
+        messageInputEl.addEventListener('compositionstart', () => {
+          messageInputComposing = true;
+        });
+        messageInputEl.addEventListener('compositionend', () => {
+          messageInputComposing = false;
+        });
         messageInputEl.addEventListener('keydown', (event) => {
+          if (messageInputComposing || event.isComposing) {
+            return;
+          }
           if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault();
             sendMessage();
