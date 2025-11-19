@@ -57,6 +57,7 @@ export type NotificationLevel = 'info' | 'warning' | 'error' | 'success';
 export type BlackboardCategory =
   | 'user'
   | 'agent_summary'
+  | 'agent_response'
   | 'moderator'
   | 'system_event'
   | 'automation';
@@ -71,7 +72,6 @@ export interface Session {
   id: string;
   created_at: number;
   updated_at: number;
-  metadata: Record<string, any> | null;
 }
 
 // Agent
@@ -562,6 +562,24 @@ export interface AgentHealthFilter {
   status?: AgentHealthRecord['status'];
   minActiveTaskCount?: number;
   maxActiveTaskCount?: number;
+}
+
+export interface Message {
+  id: string;
+  conversationId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+}
+
+export interface Conversation {
+  id: string;
+  sessionId: string;
+  title: string;
+  messages: Message[];
+  createdAt: number;
+  updatedAt: number;
+  metadata?: Record<string, any> | null;
 }
 
 export interface SensitiveKeywordFilter {

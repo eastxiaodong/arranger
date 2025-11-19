@@ -21,6 +21,7 @@ export { ManagerLLMService } from './manager-llm.service';
 export { ManagerOrchestratorService } from './manager-orchestrator.service';
 export { SchedulerService } from './scheduler.service';
 export { FailoverService } from './failover.service';
+export { AutomationService } from './automation.service';
 
 // Infrastructure 层服务
 export { MCPServerService, MCPService } from '../../infrastructure/mcp';
@@ -95,7 +96,7 @@ export function createServices(options: ServiceFactoryOptions): ServiceFactoryRe
   stateStore.initialize();
   const agentService = new AgentService(globalConfigDb, db, events, stateStore);
   const notificationService = new NotificationService(db, events);
-  const messageService = new MessageService(db, events);
+  const messageService = new MessageService(db, events, stateStore);
   const taskContextService = new TaskContextService(messageService);
   const mcpServerService = new MCPServerService(globalConfigDb, events);
   const mcpService = new MCPService(mcpServerService, events, outputChannel);
@@ -146,6 +147,9 @@ export function createServices(options: ServiceFactoryOptions): ServiceFactoryRe
   });
   services.automation = automationService;
   events.emit('manager_llm_config_updated', managerLLMService.getConfig());
+  const schedulerService = new SchedulerService(agentService, taskService, stateStore, events, outputChannel);
+  services.scheduler = schedulerService;
+
   const managerOrchestrator = new ManagerOrchestratorService({
     managerLLM: managerLLMService,
     messageService,
@@ -157,24 +161,16 @@ export function createServices(options: ServiceFactoryOptions): ServiceFactoryRe
     state: stateStore,
     events,
     output: outputChannel,
-    agentService
+    agentService,
+    sessionService: services.session,
+    scheduler: schedulerService,
+    mcpService,
+    mcpServerService: mcpServerService
   });
   services.managerOrchestrator = managerOrchestrator;
 
-  const schedulerService = new SchedulerService(agentService, taskService, stateStore, events, outputChannel);
-  services.scheduler = schedulerService;
-
-  const failoverService = new FailoverService(
-    agentService,
-    taskService,
-    stateStore,
-    events,
-    outputChannel,
-    notificationService,
-    messageService
-  );
+  const failoverService = new FailoverService(agentService, taskService, stateStore, events, outputChannel, notificationService, messageService);
   services.failover = failoverService;
-  failoverService.start();
 
   return {
     services,

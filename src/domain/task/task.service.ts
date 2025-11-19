@@ -38,6 +38,7 @@ interface TimeoutOutcome {
 export class TaskService {
   private latestTimeoutRecord: TaskTimeoutRecord | null = null;
   private lastSweepDurationMs = 0;
+  private scheduler?: import('../../application/services/scheduler.service').SchedulerService;
 
   constructor(
     private db: DatabaseManager,
@@ -47,7 +48,11 @@ export class TaskService {
     private readonly aceContext?: AceContextService,
     private notificationService?: NotificationService,
     private messageService?: MessageService,
-  ) {}
+  ) { }
+
+  setScheduler(scheduler: import('../../application/services/scheduler.service').SchedulerService) {
+    this.scheduler = scheduler;
+  }
 
   private broadcastTasks(): void {
     const tasks = this.db.getTasks({});
@@ -409,9 +414,22 @@ export class TaskService {
     if (!candidates.length) {
       return;
     }
+
+    // Calculate load for each candidate
+    const agentLoads = new Map<string, number>();
+    const allRunningTasks = this.db.getTasks({ status: 'running' });
+    const allAssignedTasks = this.db.getTasks({ status: 'assigned' });
+
+    [...allRunningTasks, ...allAssignedTasks].forEach(t => {
+      if (t.assigned_to) {
+        agentLoads.set(t.assigned_to, (agentLoads.get(t.assigned_to) || 0) + 1);
+      }
+    });
+
     const difficulty = this.parseTaskDifficulty(task);
     const requiredTier = difficulty === 'high' ? 7 : difficulty === 'medium' ? 5 : 3;
     const priorityWeight = task.priority === 'high' ? 1.5 : task.priority === 'low' ? 0.75 : 1;
+
     const scoreAgent = (agent: any) => {
       const tags = (agent.capability_tags || agent.capabilities || []).map((c: string) => c.toLowerCase());
       const intentText = `${task.title || ''} ${task.intent || ''}`.toLowerCase();
@@ -425,13 +443,24 @@ export class TaskService {
       const cost = typeof agent.cost_factor === 'number' && agent.cost_factor > 0 ? agent.cost_factor : 1;
       const efficiency = reasoning / cost;
       const tierGap = reasoning - requiredTier;
+
+      // Load Penalty: Reduce score by factor of (1 + load * 2)
+      // e.g., load 0 -> factor 1 (no penalty)
+      // load 1 -> factor 3 (score / 3)
+      // load 2 -> factor 5 (score / 5)
+      const currentLoad = agentLoads.get(agent.id) || 0;
+      const loadPenaltyFactor = 1 + (currentLoad * 2);
+
       // 高难度优先高推理；低难度鼓励低成本
-      const difficultyScore = tierGap * 1.5 + efficiency;
-      return (tagScore * 2 + difficultyScore) * priorityWeight;
+      const baseScore = (tagScore * 2 + (tierGap * 1.5 + efficiency)) * priorityWeight;
+
+      return baseScore / loadPenaltyFactor;
     };
+
     const best = [...candidates]
       .map(agent => ({ agent, score: scoreAgent(agent) }))
       .sort((a, b) => b.score - a.score)[0];
+
     if (best && best.score > 0) {
       this.updateTaskRecord(task.id, { assigned_to: best.agent.id, status: task.status === 'pending' ? 'assigned' : task.status });
       this.events.emit('tasks_update', this.db.getTasks({}));

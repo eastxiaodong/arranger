@@ -64,6 +64,17 @@ export class SchedulerService {
     private readonly output: OutputChannel
   ) {
     this.initializeLoadTracking();
+    this.setupEventListeners();
+  }
+
+  private setupEventListeners() {
+    this.events.on('state:task_transitioned', ({ taskState, transition }) => {
+      if (transition.to === 'active' && taskState.assignedTo) {
+        this.recordAssignment(taskState.taskId, taskState.assignedTo);
+      } else if ((transition.to === 'done' || transition.to === 'failed') && taskState.assignedTo) {
+        this.recordCompletion(taskState.taskId, taskState.assignedTo);
+      }
+    });
   }
 
   /**
@@ -98,7 +109,7 @@ export class SchedulerService {
    */
   selectBestAgent(context: SchedulingContext): AgentScore | null {
     const scores = this.scoreAllAgents(context);
-    
+
     if (scores.length === 0) {
       this.output.appendLine('[Scheduler] 没有可用的Agent');
       return null;
@@ -243,7 +254,7 @@ export class SchedulerService {
    */
   private scoreCostOptimization(agent: Agent): number {
     const costFactor = agent.cost_factor || 1.0;
-    
+
     // 成本系数越低越好
     if (costFactor <= 0.5) {
       return 100;
@@ -260,8 +271,8 @@ export class SchedulerService {
   private labelMatches(taskLabel: string, capability: string): boolean {
     const normalize = (s: string) => s.toLowerCase().replace(/[_-]/g, '');
     return normalize(taskLabel) === normalize(capability) ||
-           taskLabel.includes(capability) ||
-           capability.includes(taskLabel);
+      taskLabel.includes(capability) ||
+      capability.includes(taskLabel);
   }
 
   /**
@@ -269,12 +280,12 @@ export class SchedulerService {
    */
   private extractDifficulty(labels: string[] | null): string {
     if (!labels) return 'medium';
-    
+
     const diffLabel = labels.find(l => l.startsWith('difficulty:'));
     if (diffLabel) {
       return diffLabel.replace('difficulty:', '');
     }
-    
+
     return 'medium';
   }
 
@@ -283,7 +294,7 @@ export class SchedulerService {
    */
   private buildScoringReasoning(agent: Agent, breakdown: AgentScore['breakdown'], taskState: TaskStateRecord): string {
     const parts: string[] = [];
-    
+
     parts.push(`Agent: ${agent.id}`);
     parts.push(`场景匹配: ${breakdown.sceneMatch.toFixed(1)}/100`);
     parts.push(`推理适配: ${breakdown.reasoningFit.toFixed(1)}/100`);
@@ -299,7 +310,7 @@ export class SchedulerService {
    */
   updateWeights(weights: Partial<ScoringWeights>): void {
     Object.assign(this.weights, weights);
-    
+
     // 验证权重总和为1
     const sum = Object.values(this.weights).reduce((a, b) => a + b, 0);
     if (Math.abs(sum - 1.0) > 0.01) {
@@ -316,7 +327,7 @@ export class SchedulerService {
     if (!this.taskAssignmentHistory.has(taskId)) {
       this.taskAssignmentHistory.set(taskId, []);
     }
-    
+
     const history = this.taskAssignmentHistory.get(taskId)!;
     history.push(agentId);
 
@@ -324,7 +335,7 @@ export class SchedulerService {
     const currentLoad = this.agentLoadMap.get(agentId) || 0;
     this.agentLoadMap.set(agentId, currentLoad + 1);
 
-    this.output.appendLine(`[Scheduler] 任务 ${taskId} 已分配给 ${agentId}`);
+    // this.output.appendLine(`[Scheduler] 任务 ${taskId} 已分配给 ${agentId}`);
   }
 
   /**
@@ -336,7 +347,7 @@ export class SchedulerService {
       this.agentLoadMap.set(agentId, currentLoad - 1);
     }
 
-    this.output.appendLine(`[Scheduler] 任务 ${taskId} 已完成，${agentId} 负载减少`);
+    // this.output.appendLine(`[Scheduler] 任务 ${taskId} 已完成，${agentId} 负载减少`);
   }
 
   /**

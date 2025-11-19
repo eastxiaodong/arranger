@@ -2,8 +2,9 @@
 <html lang="zh-CN">
 
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="thinking-collapse.js"></script>
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
   <title>Arranger 面板</title>
@@ -4739,36 +4740,36 @@
 
         <!-- Tab 2: Agent Workspace -->
         <div id="main-tab-workspace" class="main-tab-content">
-      <div class="workspace-container">
-        <div id="workspace-empty" class="workspace-empty">
-          <div>请选择一个 Agent 查看工作台</div>
-          <div style="margin-top: 6px; font-size: 12px;">选中左侧 Agent 卡片后，这里显示与该 Agent 的单聊时间线</div>
-        </div>
-        <div id="workspace-panel" class="workspace-panel hidden">
-          <div class="workspace-header">
-            <div class="workspace-agent-meta">
-              <div class="workspace-agent-name" id="workspace-agent-name">Agent</div>
-              <div class="workspace-agent-subtitle" id="workspace-agent-meta">状态与指标</div>
-              <div class="workspace-header-meta" id="workspace-agent-extra"></div>
-              <div class="workspace-status-strip">
-                <span class="workspace-status-dot" id="workspace-agent-status-dot"></span>
-                <span id="workspace-agent-status-text">--</span>
+          <div class="workspace-container">
+            <div id="workspace-empty" class="workspace-empty">
+              <div>请选择一个 Agent 查看工作台</div>
+              <div style="margin-top: 6px; font-size: 12px;">选中左侧 Agent 卡片后，这里显示与该 Agent 的单聊时间线</div>
+            </div>
+            <div id="workspace-panel" class="workspace-panel hidden">
+              <div class="workspace-header">
+                <div class="workspace-agent-meta">
+                  <div class="workspace-agent-name" id="workspace-agent-name">Agent</div>
+                  <div class="workspace-agent-subtitle" id="workspace-agent-meta">状态与指标</div>
+                  <div class="workspace-header-meta" id="workspace-agent-extra"></div>
+                  <div class="workspace-status-strip">
+                    <span class="workspace-status-dot" id="workspace-agent-status-dot"></span>
+                    <span id="workspace-agent-status-text">--</span>
+                  </div>
+                </div>
+                <div class="workspace-header-actions">
+                  <button data-action="refreshWorkspace">刷新</button>
+                </div>
+              </div>
+              <div id="workspace-timeline" class="workspace-timeline">
+                <div class="workspace-empty-hint">暂无对话，发送一条消息开始吧。</div>
+              </div>
+              <div class="workspace-input">
+                <textarea id="workspace-input" placeholder="与该 Agent 单聊，无需 @"></textarea>
+                <button id="workspace-send-btn" type="button">发送</button>
               </div>
             </div>
-            <div class="workspace-header-actions">
-              <button data-action="refreshWorkspace">刷新</button>
-            </div>
-          </div>
-          <div id="workspace-timeline" class="workspace-timeline">
-            <div class="workspace-empty-hint">暂无对话，发送一条消息开始吧。</div>
-          </div>
-          <div class="workspace-input">
-            <textarea id="workspace-input" placeholder="与该 Agent 单聊，无需 @"></textarea>
-            <button id="workspace-send-btn" type="button">发送</button>
           </div>
         </div>
-      </div>
-    </div>
 
         <!-- Tab 3: Global Configuration -->
         <div id="main-tab-global" class="main-tab-content">
@@ -4778,7 +4779,7 @@
                 onclick="switchGlobalConfigTab('agents')">Agent 管理</button>
               <button class="global-config-tab" data-global-tab="mcp" onclick="switchGlobalConfigTab('mcp')">MCP
                 配置</button>
-              <button class="global-config-tab" data-global-tab="ace" onclick="switchGlobalConfigTab('ace')">ACE 集成
+              <button class="global-config-tab" data-global-tab="ace" onclick="switchGlobalConfigTab('ace')">ACE
                 集成</button>
               <button class="global-config-tab" data-global-tab="manager-llm"
                 onclick="switchGlobalConfigTab('manager-llm')">经理 LLM</button>
@@ -5246,10 +5247,6 @@
           <div class="session-id-preview" id="session-create-preview"></div>
           <div class="form-hint">系统将自动生成唯一的会话 ID</div>
         </div>
-        <div class="form-group">
-          <label class="form-label">会话说明（可选）</label>
-          <textarea class="form-textarea" id="session-create-description" placeholder="描述这个会话的用途..." rows="3"></textarea>
-        </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" data-action="closeModal">取消</button>
@@ -5313,7 +5310,8 @@
       <div class="modal-body">
         <div class="form-group">
           <label class="form-label required">配置 JSON</label>
-          <textarea class="form-textarea" id="mcp-config-json" placeholder='{"command": "uvx", "args": ["package@latest"]}' rows="10"></textarea>
+          <textarea class="form-textarea" id="mcp-config-json"
+            placeholder='{"command": "uvx", "args": ["package@latest"]}' rows="10"></textarea>
           <div class="form-hint">请输入符合 MCP 规范的 JSON 配置</div>
           <div class="form-error" id="mcp-config-error"></div>
         </div>
@@ -5563,6 +5561,24 @@
       function getSelectedCapabilities(form) {
         const chips = form?.querySelectorAll('#agent-capabilities-cloud .tag-chip.selected');
         return chips ? Array.from(chips).map(chip => chip.dataset.capability) : [];
+      }
+
+      // 预留：工具权限选择。目前界面未提供具体选项，保持兼容以避免调用时报错。
+      function setSelectedToolPermissions(form, permissions) {
+        // 如果未来增加工具权限云，在此同步按钮选中状态
+        const container = form?.querySelector('#agent-tool-permissions-cloud');
+        if (!container) {
+          return;
+        }
+        const permissionSet = new Set(permissions || []);
+        const chips = container.querySelectorAll('.tag-chip');
+        chips.forEach(chip => {
+          if (permissionSet.has(chip.dataset.permission)) {
+            chip.classList.add('selected');
+          } else {
+            chip.classList.remove('selected');
+          }
+        });
       }
 
       function setSelectedCapabilities(form, capabilities) {
@@ -6139,13 +6155,14 @@
 
       function resetSessionScopedState(nextSessionId) {
         allTasks = [];
-        sessionTasks = [];        allMessages = [];
+        sessionTasks = []; allMessages = [];
         allAssists = [];
         allNotifications = [];
-        allFileChanges = [];        allThinkingLogs = [];
+        allFileChanges = []; allThinkingLogs = [];
         taskDependencyGraph = buildTaskDependencyGraph([]);
         latestTaskMetrics = null;
-        latestTaskMetricsSessionId = null;      }
+        latestTaskMetricsSessionId = null;
+      }
 
       function refreshSessionScopedData(options = {}) {
         if (!currentSessionId) {
@@ -6161,10 +6178,10 @@
         vscode.postMessage({ type: 'get_notifications', data: payload });
         vscode.postMessage({ type: 'get_tool_runs', data: payload });
         vscode.postMessage({ type: 'get_assists', data: payload });
-        vscode.postMessage({ type: 'get_file_changes', data: payload });        vscode.postMessage({
+        vscode.postMessage({ type: 'get_file_changes', data: payload }); vscode.postMessage({
           type: 'get_thinking_logs',
           data: { filters: { session_id: currentSessionId, limit: WORKSPACE_THINKING_LIMIT } }
-        });        requestTaskMetrics({ showLoading });
+        }); requestTaskMetrics({ showLoading });
       }
 
       function requestMessagesSnapshot(reason = 'manual') {
@@ -6665,9 +6682,9 @@
         const cardsHtml = displayAgents.map(agent => {
           const isSelected = selectedAgentId === agent.id;
           const statusClass = agent.status === 'online' ? 'agent-status-online' :
-                             agent.status === 'busy' ? 'agent-status-busy' :
-                             'agent-status-offline';
-        
+            agent.status === 'busy' ? 'agent-status-busy' :
+              'agent-status-offline';
+
           return `
             <div class="agent-card ${isSelected ? 'selected' : ''}" data-agent-id="${agent.id}" onclick="selectAgent('${agent.id}', event)">
               <div class="agent-card-header">
@@ -6705,7 +6722,7 @@
       function buildTaskDependencyGraph(tasks) {
         if (!Array.isArray(tasks)) return new Map();
         const map = new Map();
-        tasks.forEach(() => {});
+        tasks.forEach(() => { });
         return map;
       }
       const THINKING_TYPE_OPTIONS = [
@@ -7032,12 +7049,12 @@
       };
 
       // 兼容旧事件钩子，保持空实现避免错误
-      function switchWorkspaceTabInternal() {}
-      window.switchWorkspaceTab = function () {};
-      window.setWorkspaceThinkingScope = function () {};
-      window.handleWorkspaceThinkingSearch = function () {};
-      window.toggleThinkingTypeFilter = function () {};
-      window.resetThinkingTypeFilters = function () {};
+      function switchWorkspaceTabInternal() { }
+      window.switchWorkspaceTab = function () { };
+      window.setWorkspaceThinkingScope = function () { };
+      window.handleWorkspaceThinkingSearch = function () { };
+      window.toggleThinkingTypeFilter = function () { };
+      window.resetThinkingTypeFilters = function () { };
 
       function renderGlobalAgentTable(agents) {
         const container = document.getElementById('global-agent-list');
@@ -7085,7 +7102,7 @@
               : agent.status === 'busy'
                 ? 'agent-status-busy'
                 : 'agent-status-offline';
-         const isRefreshing = pendingAgentRefresh.has(agent.id);
+          const isRefreshing = pendingAgentRefresh.has(agent.id);
           const refreshText = isRefreshing ? '刷新中...' : '刷新';
           const statusDetail = agent.status_detail ? escapeHtml(agent.status_detail) : '';
           const toggleLabel = isEnabled ? '停用' : '启用';
@@ -7847,7 +7864,8 @@
         if (!Array.isArray(labels)) {
           return null;
         }
-        for (const label of labels) {          if (label.startsWith('role:')) {
+        for (const label of labels) {
+          if (label.startsWith('role:')) {
             return label.replace('role:', '');
           }
         }
@@ -8092,7 +8110,14 @@
         const base = msg && msg.content ? msg.content : '';
         const mentions = Array.isArray(msg?.mentions) ? msg.mentions.filter(Boolean) : [];
         const escapedBase = escapeHtml(base);
-        if (msg?.agent_id === 'user' && mentions.length === 1) {
+
+        // 处理agent回复的思考过程折叠
+        if (msg.agent_id && msg.agent_id !== 'user' && msg.category === 'agent_response') {
+          return formatAgentMessageWithThinking(base);
+        // 处理agent回复的思考过程折叠
+        if (msg.agent_id && msg.agent_id !== 'user' && msg.category === 'agent_response') {
+          return formatAgentMessageWithThinking(base);
+        }        }        if (msg?.agent_id === 'user' && mentions.length === 1) {
           // 如果内容已经以 @ 开头且匹配提及，则不再重复添加前缀
           const normalizedBase = base.trim();
           const mentionId = mentions[0];
@@ -8114,7 +8139,7 @@
         const contextRefs = Array.isArray(msg.payload?.context_refs) ? msg.payload.context_refs : [];
         if (!contextRefs.length) return '';
 
-        return `<div class="message-reference-cards">${contextRefs.map(ref => 
+        return `<div class="message-reference-cards">${contextRefs.map(ref =>
           `<div class="message-ref-card">上下文：${escapeHtml(ref)}</div>`
         ).join('')}</div>`;
       }
@@ -9278,7 +9303,7 @@
         allMcpServers = Array.isArray(servers) ? servers : [];
         const container = document.getElementById('mcp-server-list');
         const statsEl = document.getElementById('mcp-server-stats');
-        
+
         if (!container) return;
 
         // 1. 清理无效的缓存
@@ -9301,11 +9326,11 @@
        */
       function cleanupMcpCaches() {
         const validIds = new Set(allMcpServers.map(server => server.id));
-        
+
         Array.from(mcpToolsCache.keys()).forEach(id => {
           if (!validIds.has(id)) mcpToolsCache.delete(id);
         });
-        
+
         Array.from(pendingMcpRefresh).forEach(id => {
           if (!validIds.has(id)) pendingMcpRefresh.delete(id);
         });
@@ -9338,7 +9363,7 @@
        * @param {HTMLElement} container - 容器元素
        */
       function renderMcpEmptyState(container) {
-        container.innerHTML = 
+        container.innerHTML =
           '<div class="empty-state">暂无 MCP Server 配置' +
           '<div class="mcp-empty-cta">' +
           '<button class="mcp-btn" data-action="openMcpAddModal">立即添加</button>' +
@@ -9353,15 +9378,15 @@
       function buildMcpServerCard(server) {
         const statusInfo = mcpServerStatus.get(server.id);
         const isEnabled = server.enabled !== false;
-        
+
         // 构建各个部分
         const statusBadge = buildMcpServerStatusBadge(isEnabled, statusInfo);
         const serverInfo = buildMcpServerInfo(server);
         const toolsSummary = buildMcpServerToolsSummary(server, statusInfo);
         const actions = buildMcpServerActions(server, isEnabled, statusInfo);
-        const stateHint = isEnabled ? '' : 
+        const stateHint = isEnabled ? '' :
           '<div class="global-agent-meta">此 Server 已停用，启用后即可重新连接并刷新状态</div>';
-        
+
         const cardClasses = 'mcp-server-card' + (isEnabled ? '' : ' disabled');
 
         return `
@@ -9410,16 +9435,16 @@
         const statusToolCount = typeof statusInfo?.toolCount === 'number' ? statusInfo.toolCount : null;
 
         let html = `<div>${escapeHtml(server.command)}${argsPreview ? ' ' + escapeHtml(argsPreview) : ''}</div>`;
-        
+
         if (server.description) {
           html += `<div>${escapeHtml(server.description)}</div>`;
         }
         if (envPreview) {
           html += `<div>Env: ${escapeHtml(envPreview)}</div>`;
         }
-        
+
         html += `<div class="global-agent-meta">工具缓存：${statusToolCount !== null ? statusToolCount + ' 个' : '未知'}</div>`;
-        
+
         return html;
       }
 
@@ -9431,19 +9456,19 @@
        */
       function buildMcpServerToolsSummary(server, statusInfo) {
         const tools = mcpToolsCache.get(server.id);
-        
+
         if (!tools) {
           return '<div class="global-agent-meta">工具列表将自动加载，保存后稍候查看</div>';
         }
 
         const toolItems = Array.isArray(tools) && tools.length > 0
           ? tools.map(tool => {
-              const toolName = tool.name || tool.id || '(未命名)';
-              const fullText = toolName + (tool.description ? '：' + tool.description : '');
-              return `<div class="mcp-tool-item" title="${escapeHtml(fullText)}">` +
-                `${escapeHtml(toolName)}${tool.description ? '：' + escapeHtml(tool.description) : ''}` +
-                `</div>`;
-            }).join('')
+            const toolName = tool.name || tool.id || '(未命名)';
+            const fullText = toolName + (tool.description ? '：' + tool.description : '');
+            return `<div class="mcp-tool-item" title="${escapeHtml(fullText)}">` +
+              `${escapeHtml(toolName)}${tool.description ? '：' + escapeHtml(tool.description) : ''}` +
+              `</div>`;
+          }).join('')
           : '<div class="global-agent-meta">暂无工具配置</div>';
 
         return `<details style="margin-top: 8px;"><summary>工具列表 (${tools.length})</summary>${toolItems}</details>`;
@@ -10235,12 +10260,39 @@
         if (!payload) {
           return;
         }
+        
+        // 处理思考过程折叠
+        let processedContent = payload.content;
+        if (payload.content && typeof window.processThinkingContent === 'function') {
+          processedContent = window.processThinkingContent(payload.content);
+        }
+        
+        // 保存LLM回复到对话历史
+        if (payload.status === 'done' && payload.content && payload.session_id) {
+          // 发送消息到后端保存到对话历史
+          const messageData = {
+            content: processedContent, // 使用处理后的内容
+            priority: 'normal',
+            session_id: payload.session_id,
+            agent_id: payload.agent_id,
+            category: 'agent_summary', // 使用现有的类型
+            visibility: 'blackboard',
+            task_id: payload.task_id
+          };
+          
+          vscode.postMessage({
+            type: 'send_message',
+            data: messageData
+          });
+        }
+        
         const key = payload.task_id || ('agent:' + (payload.agent_id || 'unknown'));
         if (payload.status === 'done' || payload.status === 'error') {
           llmStreamStates.delete(key);
         } else {
           llmStreamStates.set(key, {
             ...payload,
+            content: processedContent, // 使用处理后的内容
             updatedAt: payload.timestamp || Date.now()
           });
         }
@@ -10482,7 +10534,7 @@
        */
       function resetAgentModalState(modal) {
         if (!modal) return;
-        
+
         const form = modal.querySelector('form');
         if (!form) return;
 
@@ -10568,7 +10620,7 @@
       window.closeModal = function () {
         console.log('[MinimalPanel] Closing modal');
         const modals = document.querySelectorAll('.modal-overlay.show');
-        
+
         if (!modals || modals.length === 0) {
           console.warn('[MinimalPanel] No open modals found');
           return;
@@ -10737,7 +10789,7 @@
         }
       });
 
-      window.addEventListener('beforeunload', () => {      });
+      window.addEventListener('beforeunload', () => { });
 
       // 添加 Agent
       window.addAgent = function () {
@@ -10772,7 +10824,7 @@
        */
       window.submitAddAgent = function () {
         console.log('[MinimalPanel] Submit add agent');
-        
+
         try {
           const form = document.getElementById('form-add-agent');
           if (!form) {
@@ -10790,7 +10842,7 @@
           // 收集表单数据
           const formData = new FormData(form);
           const capabilities = getSelectedCapabilities(form);
-          
+
           // 验证能力标签
           if (!capabilities || capabilities.length === 0) {
             updateStatus('请至少选择一个能力标签');
@@ -10836,7 +10888,7 @@
        */
       window.submitEditAgent = function () {
         console.log('[MinimalPanel] Submit edit agent');
-        
+
         try {
           const form = document.getElementById('form-add-agent');
           if (!form) {
@@ -10868,7 +10920,7 @@
           // 收集表单数据
           const formData = new FormData(form);
           const capabilities = getSelectedCapabilities(form);
-          
+
           // 验证能力标签
           if (!capabilities || capabilities.length === 0) {
             updateStatus('请至少选择一个能力标签');
@@ -11114,7 +11166,7 @@
             focusBacklogSummary(null);
           } else if (action === 'setFileChangeView') {
             const view = actionElement.getAttribute('data-view') || 'timeline';
-            window.setFileChangeView(view); 
+            window.setFileChangeView(view);
           } else if (action === 'filterFileChangesByTask') {
             const taskId = actionElement.getAttribute('data-task-id') || '';
             window.filterFileChangesByTask(taskId);
@@ -11229,7 +11281,7 @@
           console.error('[MinimalPanel] Error in click event handler:', error);
         }
       });
-      
+
 
       // 接收来自后端的消息
       // ✅ 旧的测试代码已清理，现在使用新的标签切换逻辑（switchMainTab, switchBlackboardView）
@@ -11237,7 +11289,7 @@
 
       // 自动加载初始数据
       console.log('[MinimalPanel] Loading initial data...');
-      
+
       // 基础配置数据
       vscode.postMessage({ type: 'get_agents' });
       vscode.postMessage({ type: 'get_sessions' });
@@ -11245,12 +11297,12 @@
       vscode.postMessage({ type: 'get_ace_config' });
       vscode.postMessage({ type: 'get_ace_state' });
       vscode.postMessage({ type: 'get_manager_llm_config' });
-      
+
       // 任务相关数据
       vscode.postMessage({ type: 'get_tasks' });
       vscode.postMessage({ type: 'get_task_backlogs' });
       requestTaskMetrics();
-      
+
       // 会话相关数据（如果有当前会话）
       if (typeof currentSessionId !== 'undefined' && currentSessionId) {
         const payload = { sessionId: currentSessionId };
@@ -11264,5 +11316,126 @@
   </script>
 </body>
 
-</html>
-      
+</html>/**
+ * 思考过程折叠功能
+ * 用于优化消息面板显示，将agent的思考过程折叠隐藏
+ */
+
+// 添加CSS样式
+function addThinkingStyles() {
+  if (document.getElementById('thinking-styles')) {
+    return; // 已经添加过了
+  }
+
+  const styleElement = document.createElement('style');
+  styleElement.id = 'thinking-styles';
+  styleElement.textContent = `
+    .thinking-section {
+      margin: 8px 0;
+    }
+    .thinking-toggle:hover {
+      color: var(--vscode-foreground) !important;
+    }
+    .thinking-step:last-child {
+      margin-bottom: 0 !important;
+    }
+    .final-summary {
+      animation: fadeIn 0.3s ease-in;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  `;
+  document.head.appendChild(styleElement);
+}
+
+/**
+ * 格式化agent消息，折叠思考过程
+ * @param {string} content - 原始消息内容
+ * @returns {string} 格式化后的HTML
+ */
+function formatAgentMessageWithThinking(content) {
+  if (!content) return '';
+  
+  // 检测思考过程标记
+  const thinkingRegex = /<thinking>([\s\S]*?)<\/thinking>/gi;
+  const thinkingMatches = content.match(thinkingRegex);
+  
+  if (!thinkingMatches || thinkingMatches.length === 0) {
+    // 没有思考过程，直接返回内容
+    return escapeHtml(content);
+  }
+  
+  // 提取思考过程和最终内容
+  let finalContent = content;
+  const thinkingContents = [];
+  
+  thinkingMatches.forEach(match => {
+    // 移除thinking标签，保留内容
+    const thinkingContent = match.replace(/<\/?thinking>/gi, '').trim();
+    if (thinkingContent) {
+      thinkingContents.push(thinkingContent);
+    }
+    // 从最终内容中移除思考过程
+    finalContent = finalContent.replace(match, '');
+  });
+  
+  // 清理最终内容（移除多余的空行）
+  finalContent = finalContent.replace(/\n\s*\n/g, '\n').trim();
+  
+  const hasThinking = thinkingContents.length > 0;
+  const thinkingId = `thinking-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  
+  let html = '';
+  
+  // 如果有思考过程，添加折叠的思考内容
+  if (hasThinking) {
+    html += `
+      <div class="thinking-section">
+        <div class="thinking-toggle" onclick="toggleThinking('${thinkingId}')" style="cursor: pointer; margin-bottom: 8px; color: var(--vscode-descriptionForeground); font-size: 12px;">
+          <span id="${thinkingId}-icon">▶</span>
+          <span>思考过程 (${thinkingContents.length} 步)</span>
+        </div>
+        <div id="${thinkingId}-content" class="thinking-content" style="display: none; margin-bottom: 12px; padding: 12px; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border); border-radius: 4px; font-size: 12px; line-height: 1.4;">
+          ${thinkingContents.map((thinking, index) => 
+            `<div class="thinking-step" style="margin-bottom: 8px;">
+              <div class="thinking-step-header" style="font-weight: bold; color: var(--vscode-foreground); margin-bottom: 4px;">步骤 ${index + 1}:</div>
+              <div class="thinking-step-content" style="color: var(--vscode-descriptionForeground); white-space: pre-wrap;">${escapeHtml(thinking)}</div>
+            </div>`
+          ).join('')}
+        </div>
+      </div>
+    `;
+  }
+  
+  // 添加最终总结内容
+  if (finalContent) {
+    html += `
+      <div class="final-summary" style="padding: 12px; background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin-top: 8px;">
+        <div class="summary-header" style="font-weight: bold; color: var(--vscode-foreground); margin-bottom: 8px; font-size: 13px;">📋 总结</div>
+        <div class="summary-content" style="color: var(--vscode-foreground); line-height: 1.5; white-space: pre-wrap;">${escapeHtml(finalContent)}</div>
+      </div>
+    `;
+  }
+  
+  return html;
+}
+
+/**
+ * 切换思考过程显示/隐藏
+ * @param {string} thinkingId - 思考过程ID
+ */
+function toggleThinking(thinkingId) {
+  const content = document.getElementById(`${thinkingId}-content`);
+  const icon = document.getElementById(`${thinkingId}-icon`);
+  
+  if (content && icon) {
+    const isHidden = content.style.display === 'none';
+    content.style.display = isHidden ? 'block' : 'none';
+    icon.textContent = isHidden ? '▼' : '▶';
+  }
+}
+
+// 初始化样式
+addThinkingStyles();

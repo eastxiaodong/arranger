@@ -11,7 +11,9 @@ import type { StateStore } from '../../domain/state';
 import { createLLMClient, type LLMProvider } from '../../infrastructure/llm';
 import type { BaseLLMClient, LLMMessage } from '../../infrastructure/llm/base';
 import type { AutomationService } from './automation.service';
+import type { SessionService } from '../../domain/session/session.service';
 import type { AgentService } from '../../domain/agent/agent.service';
+import type { MCPService, MCPServerService } from '../../infrastructure/mcp';
 
 interface ManagerOrchestratorOptions {
   managerLLM: ManagerLLMService;
@@ -19,12 +21,16 @@ interface ManagerOrchestratorOptions {
   assistService: AssistService;
   taskService: TaskService;
   toolService: ToolExecutionService;
+  sessionService: SessionService;
   automationService?: AutomationService;
   notificationService?: NotificationService;
   state: StateStore;
   events: TypedEventEmitter;
   output: OutputChannel;
   agentService: AgentService;
+  scheduler: import('./scheduler.service').SchedulerService;
+  mcpService: MCPService;
+  mcpServerService: MCPServerService;
 }
 
 interface ManagerIntent {
@@ -55,7 +61,7 @@ const DEFAULT_SYSTEM_PROMPT = [
 export class ManagerOrchestratorService {
   private readonly queue: BlackboardEntry[] = [];
   private processing = false;
-   // 每个会话的节流时间戳，避免刷屏
+  // 每个会话的节流时间戳，避免刷屏
   private readonly sessionThrottle = new Map<string, number>();
   private readonly minDispatchIntervalMs = 2000;
   private resolveAssignee(agentId?: string | null): string | null {
@@ -75,6 +81,7 @@ export class ManagerOrchestratorService {
     if (!this.shouldDispatch(entry)) {
       return;
     }
+    this.options.sessionService.addMessage(entry);
     this.queue.push(entry);
     if (!this.processing) {
       void this.drainQueue();
@@ -89,12 +96,46 @@ export class ManagerOrchestratorService {
     this.options.events.off('message_posted', this.handleMessage);
   }
 
+  private async getAvailableMcpTools(): Promise<string[]> {
+    const toolList: string[] = [];
+    try {
+      const servers = this.options.mcpServerService.getAllServers({ enabled: true });
+      if (servers.length === 0) {
+        return [];
+      }
+
+      toolList.push('\n--- 可用的 MCP 工具 ---');
+      toolList.push('你可以通过在 `tool_actions` 中使用指定的工具名称格式来调用以下工具。');
+
+      for (const server of servers) {
+        try {
+          const { tools } = await this.options.mcpService.listToolsById(server.id);
+          if (tools && tools.length > 0) {
+            toolList.push(`\n服务器: ${server.name} (ID: ${server.id})`);
+            for (const tool of tools) {
+              const toolName = tool.name || (typeof tool === 'string' ? tool : '');
+              if (toolName) {
+                const description = tool.description || '无描述。';
+                toolList.push(`- 工具名称: \`${toolName}\` (使用格式: \`"mcp:${server.id}:${toolName}"\`)\n  描述: ${description}`);
+              }
+            }
+          }
+        } catch (error: any) {
+          this.options.output.appendLine(`[ManagerOrchestrator] 获取 MCP server [${server.name}] 的工具列表失败: ${error.message}`);
+        }
+      }
+    } catch (error: any) {
+      this.options.output.appendLine(`[ManagerOrchestrator] 获取 MCP servers 失败: ${error.message}`);
+    }
+    return toolList;
+  }
+
   private shouldDispatch(entry: BlackboardEntry | null | undefined): entry is BlackboardEntry {
     return Boolean(
       entry &&
-        entry.session_id &&
-        entry.category === 'user' &&
-        entry.visibility === 'blackboard'
+      entry.session_id &&
+      entry.category === 'user' &&
+      entry.visibility === 'blackboard'
     );
   }
 
@@ -137,10 +178,12 @@ export class ManagerOrchestratorService {
       return;
     }
 
+    const mcpTools = await this.getAvailableMcpTools();
+    const history = this.options.sessionService.getMessages(entry.session_id);
     const intent = this.buildIntent(entry);
     const client = this.createClient(config);
-    const systemPrompt = this.buildSystemPrompt(config.system_prompt);
-    const userPrompt = this.buildUserPrompt(intent);
+    const systemPrompt = this.buildSystemPrompt(config.system_prompt, mcpTools);
+    const userPrompt = this.buildUserPrompt(intent, history);
 
     const messages: LLMMessage[] = [
       { role: 'system', content: systemPrompt },
@@ -246,6 +289,7 @@ export class ManagerOrchestratorService {
     });
 
     if (decision) {
+      this.options.sessionService.addMessage(streamingMessage);
       void this.applyDecision(entry.session_id, decision, intent);
       this.pushManagerNotification('success', '经理决策完成', `已生成决策并写入任务/协助`, {
         message_id: entry.id,
@@ -376,6 +420,16 @@ export class ManagerOrchestratorService {
     if (!content) return null;
     const text = content.toLowerCase();
     const has = (arr: string[]) => arr.some(k => text.includes(k));
+
+    // Chat detection: simple questions, greetings, no code blocks
+    const isQuestion = text.includes('?') || text.includes('？');
+    const isSimple = text.length < 50 && !text.includes('```') && !text.includes('{') && !text.includes('}');
+    const isGreeting = has(['hi', 'hello', '你好', '在吗', 'help']);
+
+    if ((isQuestion || isGreeting) && isSimple && !has(['bug', 'fix', 'error', 'fail', 'create', 'implement', 'refactor'])) {
+      return 'type:chat';
+    }
+
     if (has(['bug', 'fix', '异常', '报错', '错误'])) return 'type:bug';
     if (has(['文档', 'doc', '说明', 'wiki', '指南'])) return 'type:doc';
     if (has(['需求', '功能', 'feature', 'story'])) return 'type:feature';
@@ -451,16 +505,32 @@ export class ManagerOrchestratorService {
     });
   }
 
-  private buildSystemPrompt(customPrompt?: string | null): string {
+  private buildSystemPrompt(customPrompt?: string | null, mcpTools?: string[]): string {
     const trimmed = customPrompt?.trim();
-    if (!trimmed) {
-      return DEFAULT_SYSTEM_PROMPT;
+    const basePrompt = `${trimmed ? `${trimmed}\n\n` : ''}${DEFAULT_SYSTEM_PROMPT}`.trim();
+
+    if (mcpTools && mcpTools.length > 0) {
+      const toolSection = mcpTools.join('\n');
+      return `${basePrompt}${toolSection}`;
     }
-    return `${trimmed}\n\n${DEFAULT_SYSTEM_PROMPT}`.trim();
+
+    return basePrompt;
   }
 
-  private buildUserPrompt(intent: ManagerIntent): string {
+  private buildUserPrompt(intent: ManagerIntent, history: BlackboardEntry[]): string {
     const parts: string[] = [];
+
+    if (history.length > 1) {
+      parts.push('--- 对话历史 ---');
+      const recentHistory = history.slice(-11, -1);
+      for (const msg of recentHistory) {
+        const role = msg.category === 'user' ? '用户' : `助手 (${msg.agent_id})`;
+        const content = this.truncate(msg.content, 200);
+        parts.push(`[${role}] ${content}`);
+      }
+      parts.push('--- 当前消息 ---');
+    }
+
     parts.push(`会话 ID：${intent.sessionId}`);
     parts.push(`消息 ID：${intent.messageId}`);
     parts.push(`优先级：${intent.priority}`);
@@ -632,7 +702,10 @@ export class ManagerOrchestratorService {
       if (updates.assigned_to === undefined) {
         const targetTask = this.options.taskService.getTask(task.id);
         if (targetTask) {
-          this.options.scheduler.tryAssignBestAgent(targetTask);
+          const taskState = this.options.state.getTaskState(task.id);
+          if (taskState) {
+            this.options.scheduler.tryAssignBestAgent(taskState);
+          }
         }
       } else if (Object.keys(updates).length) {
         this.options.taskService.updateTask(task.id, updates);

@@ -42,11 +42,109 @@ class MCPServerConnection {
 
   async callTool(toolName: string, args: Record<string, any>): Promise<any> {
     await this.ensureReady();
+    
+    // 获取可用工具列表，用于工具名称匹配
+    let tools: any[] = [];
     try {
-      return await this.sendRequest('tools/call', { name: toolName, arguments: args });
+      const listResult = await this.listTools();
+      tools = Array.isArray(listResult?.tools) ? listResult.tools : (Array.isArray(listResult) ? listResult : []);
+    } catch (error) {
+      // 如果获取工具列表失败，继续使用原始工具名
+    }
+    
+    // 尝试找到匹配的工具名
+    let actualToolName = toolName;
+    if (tools.length > 0) {
+      // 首先尝试精确匹配
+      const exactMatch = tools.find(tool => tool.name === toolName);
+      if (exactMatch) {
+        actualToolName = exactMatch.name;
+      } else {
+        // 尝试大小写不敏感匹配
+        const caseInsensitiveMatch = tools.find(tool => tool.name.toLowerCase() === toolName.toLowerCase());
+        if (caseInsensitiveMatch) {
+          actualToolName = caseInsensitiveMatch.name;
+        } else {
+          // 尝试驼峰命名与小写命名的转换
+          const camelCaseName = toolName.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+          const camelCaseMatch = tools.find(tool => tool.name === camelCaseName);
+          if (camelCaseMatch) {
+            actualToolName = camelCaseMatch.name;
+          } else {
+            const snakeCaseName = toolName.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`).replace(/^_/, '');
+            const snakeCaseMatch = tools.find(tool => tool.name === snakeCaseName);
+            if (snakeCaseMatch) {
+              actualToolName = snakeCaseMatch.name;
+            }
+          }
+        }
+      }
+    }
+    
+    try {
+      // 首先尝试使用新协议的 tools/call
+      const result = await this.sendRequest('tools/call', { name: actualToolName, arguments: args });
+      
+      // 检查响应是否包含错误信息（某些 MCP 服务器将错误包装在成功的响应中）
+      if (result && result.isError && result.content && Array.isArray(result.content)) {
+        const errorText = result.content.find((item: any) => item.type === 'text')?.text;
+        if (errorText && errorText.includes('Unknown tool')) {
+          throw new Error(errorText);
+        }
+      }
+      
+      return result;
     } catch (error: any) {
+      // 如果是工具名称错误，尝试使用原始名称
+      if (error.message && error.message.includes('Unknown tool') && actualToolName !== toolName) {
+        try {
+          const result = await this.sendRequest('tools/call', { name: toolName, arguments: args });
+          
+          // 再次检查响应是否包含错误信息
+          if (result && result.isError && result.content && Array.isArray(result.content)) {
+            const errorText = result.content.find((item: any) => item.type === 'text')?.text;
+            if (errorText && errorText.includes('Unknown tool')) {
+              throw new Error(errorText);
+            }
+          }
+          
+          return result;
+        } catch (originalError: any) {
+          throw originalError;
+        }
+      }
+      
       if (error instanceof MCPError && error.code === -32601) {
-        return this.sendRequest('call_tool', { name: toolName, arguments: args });
+        // 如果 tools/call 不支持，尝试旧协议的 call_tool
+        try {
+          const result = await this.sendRequest('call_tool', { name: actualToolName, arguments: args });
+          
+          // 检查响应是否包含错误信息
+          if (result && result.isError && result.content && Array.isArray(result.content)) {
+            const errorText = result.content.find((item: any) => item.type === 'text')?.text;
+            if (errorText && errorText.includes('Unknown tool')) {
+              throw new Error(errorText);
+            }
+          }
+          
+          return result;
+        } catch (fallbackError: any) {
+          // 如果 call_tool 也不支持，尝试 tools/call（可能只是工具名称问题）
+          if (fallbackError instanceof MCPError && fallbackError.code === -32601) {
+            const result = await this.sendRequest('tools/call', { name: actualToolName, arguments: args });
+            
+            // 检查响应是否包含错误信息
+            if (result && result.isError && result.content && Array.isArray(result.content)) {
+              const errorText = result.content.find((item: any) => item.type === 'text')?.text;
+              if (errorText && errorText.includes('Unknown tool')) {
+                throw new Error(errorText);
+              }
+            }
+            
+            return result;
+          }
+          throw fallbackError;
+        }
       }
       throw error;
     }

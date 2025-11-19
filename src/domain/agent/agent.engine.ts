@@ -5,7 +5,9 @@ import type {
   ThinkingStep,
   ToolCall,
   ThinkingStepType,
-  AgentRole
+  AgentRole,
+  Conversation,
+  Message,
 } from '../../core/types';
 
 interface RequirementPlanTask {
@@ -28,6 +30,8 @@ import { BaseLLMClient, createLLMClient, LLMProvider, LLMMessage, LLMResponse, L
 import type { Services } from '../../application/services';
 import type { TypedEventEmitter } from '../../core/events/emitter';
 import type { TaskContextSnapshot } from '../task/task-context.service';
+import { ContextManager } from '../../core/context/ContextManager';
+import type { StateStore } from '../state/state.store';
 
 const GOVERNANCE_POLL_INTERVAL = 30000;
 const TASK_LOCK_PREFIX = 'lock:task:';
@@ -62,6 +66,7 @@ export class AgentEngine {
   private context: vscode.ExtensionContext;
   private services: Services;
   private events: TypedEventEmitter;
+  private stateStore: StateStore;
   private llmClient: BaseLLMClient | null = null;
   private isRunning: boolean = false;
   private currentSessionId: string | null = null;
@@ -71,7 +76,8 @@ export class AgentEngine {
   private outputChannel: vscode.OutputChannel;
   private activeTaskId: string | null = null;
   private processingVoteTopics = new Set<string>();
-  private promptTokenBudget = 3200;
+  private conversationHistoryLimit = 50; // 保留最近 50 条历史消息，提供更好的对话连续性
+  private contextManager: ContextManager;
   // Vote system removed - listener no longer needed
   private taskUpdateListener = (tasks: Task[]) => {
     if (!this.isRunning) {
@@ -86,13 +92,16 @@ export class AgentEngine {
     context: vscode.ExtensionContext,
     services: Services,
     events: TypedEventEmitter,
-    outputChannel: vscode.OutputChannel
+    outputChannel: vscode.OutputChannel,
+    stateStore: StateStore,
   ) {
     this.config = config;
     this.context = context;
     this.services = services;
     this.events = events;
     this.outputChannel = outputChannel;
+    this.stateStore = stateStore;
+    this.contextManager = new ContextManager();
     this.tools = createTools(this.context, {
       services: this.services,
       getSessionId: () => this.currentSessionId,
@@ -216,22 +225,30 @@ export class AgentEngine {
 
   private async handleTaskUpdate(tasks: Task[]) {
     if (!this.isRunning) {
+      this.outputChannel.appendLine('[AgentEngine] Ignoring task update: agent not running');
       return;
     }
+
+    this.outputChannel.appendLine(`[AgentEngine] Task update received: ${tasks.length} tasks`);
 
     // 检查是否有分配给我的新任务
     const myTasks = tasks
       .filter(t => t.assigned_to === this.config.agent.id && t.status === 'assigned')
       .filter(t => this.services.task.canExecuteTask(t.id));
 
+    this.outputChannel.appendLine(`[AgentEngine] Found ${myTasks.length} tasks assigned to me`);
+
     for (const task of myTasks) {
       try {
+        this.outputChannel.appendLine(`[AgentEngine] Executing task ${task.id}: ${task.title || task.intent}`);
         await this.executeTask(task);
       } catch (error: any) {
         this.outputChannel.appendLine(`[AgentEngine] Failed to execute task ${task.id}: ${error.message}`);
+        this.outputChannel.appendLine(`[AgentEngine] Stack trace: ${error.stack}`);
       }
     }
   }
+
 
   private async executeTask(task: Task) {
     const previousSessionId = this.currentSessionId;
@@ -290,13 +307,17 @@ export class AgentEngine {
       });
 
       // 发送完成消息
-      if (activeSessionId) {
+      const isChat = (task.labels || []).includes('type:chat');
+      if (activeSessionId && !isChat) {
         this.recordSystemEvent(activeSessionId, `任务完成：${friendlyTitle}`, {
           task_id: task.id,
           intent: task.intent
         });
       }
       if (activeSessionId && this.shouldBroadcastTaskUpdate(task)) {
+        // For chat tasks, if we have a final summary (which is the answer), we might not need a separate "Task Completed" event 
+        // if the answer was already streamed. But `broadcastTaskSummary` sends a specific "agent_summary" message.
+        // We'll let `shouldBroadcastTaskUpdate` handle the logic.
         this.broadcastTaskSummary(task, activeSessionId, finalSummary);
       }
 
@@ -354,8 +375,8 @@ export class AgentEngine {
     const tasksToCreate = plan.tasks.map((item: RequirementPlanTask, index: number) => {
       const dependencyIds = Array.isArray(item.dependencies)
         ? item.dependencies
-            .map((depIndex: number) => generatedTaskIds[depIndex])
-            .filter(Boolean)
+          .map((depIndex: number) => generatedTaskIds[depIndex])
+          .filter(Boolean)
         : [];
 
       const normalizedRole = this.normalizeAssignedRole(item.assigned_role);
@@ -520,6 +541,9 @@ ${task.description || task.intent}
 
   private shouldBroadcastTaskUpdate(task: Task): boolean {
     const labels = task.labels || [];
+    if (labels.includes('type:chat')) {
+      return false;
+    }
     if (labels.includes('requirement') || labels.includes('plan')) {
       return true;
     }
@@ -719,25 +743,42 @@ ${task.description || task.intent}
       input_schema: tool.input_schema
     }));
 
-    const messages: LLMMessage[] = [
+    // 构建对话历史 - 确保包含当前会话的所有消息
+    let conversationHistory: LLMMessage[] = [];
+    if (sessionId) {
+      // 首先尝试从数据库加载历史
+      conversationHistory = this.buildConversationHistory(sessionId, this.conversationHistoryLimit);
+    }
+
+    // 构建当前任务的 prompt
+    const currentPrompt = this.buildTaskPrompt(task, contextSnapshot);
+
+    // 合并历史对话和当前 prompt
+    let allMessages: LLMMessage[] = [
+      ...conversationHistory,
       {
         role: 'user',
-        content: this.buildTaskPrompt(task, contextSnapshot)
+        content: currentPrompt
       }
     ];
 
     let finalSummary = '';
     let iterationCount = 0;
-    const maxIterations = 20;
+    const isChat = (task.labels || []).includes('type:chat');
+    const maxIterations = isChat ? 2 : 20;
+
+    // Loop Detection State
+    const recentActions: string[] = [];
+    const MAX_RECENT_ACTIONS = 3;
 
     while (iterationCount < maxIterations) {
       iterationCount++;
 
-      this.trimPromptMessages(messages);
+      const { compactedHistory: messagesForApi } = await this.contextManager.prepareContextForApiCall(allMessages);
 
       const response = await this.chatWithStreamForTask(
         task,
-        messages,
+        messagesForApi,
         toolSchemas,
         {
           maxTokens: 4096,
@@ -754,12 +795,30 @@ ${task.description || task.intent}
           timestamp: Date.now()
         };
         await this.recordThinkingStep(task.id, sessionId, step);
-        messages.push({ role: 'assistant', content: thought });
+        allMessages.push({ role: 'assistant', content: thought });
         finalSummary = thought;
+        
+        // 实时更新对话历史到 StateStore
+        if (sessionId) {
+          this.updateConversationHistoryRealtime(sessionId, allMessages);
+        }
       }
 
       if (response.tool_calls && response.tool_calls.length > 0) {
         for (const call of response.tool_calls) {
+          // Loop Detection Check
+          const actionSignature = `${call.name}:${JSON.stringify(call.input)}`;
+          recentActions.push(actionSignature);
+          if (recentActions.length > MAX_RECENT_ACTIONS) {
+            recentActions.shift();
+          }
+
+          if (recentActions.length === MAX_RECENT_ACTIONS && recentActions.every(a => a === actionSignature)) {
+            const errorMsg = `Loop Detected: Agent attempted the same action (${call.name}) 3 times in a row. Aborting task to prevent infinite loop.`;
+            this.outputChannel.appendLine(`[AgentEngine] ${errorMsg}`);
+            throw new Error(errorMsg);
+          }
+
           const tool = this.tools.find(t => t.name === call.name);
           const toolCall: ToolCall = {
             id: call.id,
@@ -777,9 +836,9 @@ ${task.description || task.intent}
               timestamp: toolCall.timestamp,
               toolCall
             });
-            messages.push({
+            allMessages.push({
               role: 'user',
-              content: `Tool ${call.name} failed because it is not available.`
+              content: `Tool ${call.name} execution failed: ${toolCall.error}`
             });
             continue;
           }
@@ -804,10 +863,15 @@ ${task.description || task.intent}
               timestamp: Date.now()
             });
 
-            messages.push({
+            allMessages.push({
               role: 'user',
-              content: `Tool ${call.name} result:\n${observation}`
+              content: `Tool ${call.name} (input: ${JSON.stringify(call.input)}) result:\n${observation}`
             });
+            
+            // 实时更新对话历史到 StateStore
+            if (sessionId) {
+              this.updateConversationHistoryRealtime(sessionId, allMessages);
+            }
           } catch (error: any) {
             toolCall.error = error?.message || String(error);
 
@@ -819,10 +883,15 @@ ${task.description || task.intent}
               toolCall
             });
 
-            messages.push({
+            allMessages.push({
               role: 'user',
               content: `Tool ${call.name} failed with error: ${toolCall.error}`
             });
+            
+            // 实时更新对话历史到 StateStore
+            if (sessionId) {
+              this.updateConversationHistoryRealtime(sessionId, allMessages);
+            }
           }
         }
 
@@ -832,6 +901,44 @@ ${task.description || task.intent}
       if (!response.content || response.stop_reason === 'end_turn' || response.stop_reason === 'stop_sequence') {
         break;
       }
+    }
+
+    if (sessionId) {
+      // 确保对话存在
+      let conversation = this.stateStore.getConversation(sessionId);
+      if (!conversation) {
+        conversation = this.stateStore.createConversation({
+          id: sessionId,
+          sessionId: sessionId,
+          title: 'Chat Session'
+        });
+      }
+
+      // 保存用户消息（任务prompt）
+      const userMessage = {
+        id: `msg-user-${task.id}-${Date.now()}`,
+        conversationId: sessionId,
+        role: 'user' as const,
+        content: currentPrompt,
+        timestamp: Date.now(),
+      };
+
+      // 保存助手回复（最终结果）
+      const assistantMessage = {
+        id: `msg-assistant-${task.id}-${Date.now() + 1}`,
+        conversationId: sessionId,
+        role: 'assistant' as const,
+        content: finalSummary,
+        timestamp: Date.now() + 1,
+      };
+
+      // 保存到StateStore
+      this.stateStore.addMessageToConversation(sessionId, userMessage);
+      if (finalSummary && finalSummary.trim().length > 0) {
+        this.stateStore.addMessageToConversation(sessionId, assistantMessage);
+      }
+
+      this.outputChannel.appendLine(`[AgentEngine] Saved conversation to session ${sessionId}: user(${userMessage.content.length} chars) -> assistant(${assistantMessage.content.length} chars)`);
     }
 
     return finalSummary;
@@ -865,6 +972,18 @@ ${task.description || task.intent}
   private buildSystemPrompt(task: Task): string {
     const displayName = this.config.agent.displayName || this.config.agent.id;
     const role = this.getPrimaryRole();
+    const labels = task.labels || [];
+
+    if (labels.includes('type:chat')) {
+      return [
+        `You are Agent ${displayName}, a helpful assistant.`,
+        'Answer the user\'s question directly and concisely.',
+        'Do not use <think> tags unless absolutely necessary for complex reasoning.',
+        'Do not provide a formal summary at the end.',
+        'Keep your response short and to the point.'
+      ].join('\n');
+    }
+
     return [
       `You are Agent ${displayName}, acting in the role of ${role}.`,
       'You collaborate with other agents to complete software tasks.',
@@ -923,20 +1042,81 @@ ${task.description || task.intent}
     }
   }
 
-  private trimPromptMessages(messages: LLMMessage[]) {
-    const limit = this.promptTokenBudget;
-    const countTokens = () => messages.reduce((sum, msg) => sum + this.estimateTokens(msg.content), 0);
-    while (messages.length > 1 && countTokens() > limit) {
-      messages.splice(1, 1);
-    }
-  }
+  /**
+   * 构建对话历史
+   * @param sessionId 会话 ID
+   * @param maxMessages 最大消息数量
+   * @returns LLM 消息数组
+   */
+  private buildConversationHistory(sessionId: string, maxMessages: number = 20): LLMMessage[] {
+     try {
+       const conversation = this.stateStore.getConversation(sessionId);
+ 
+       if (!conversation || !conversation.messages) {
+         return [];
+       }
+ 
+       // 只保留最近的 N 条消息
+       const recentMessages = conversation.messages.slice(-maxMessages);
+ 
+       // 转换为 LLMMessage 格式
+       return recentMessages.map(msg => ({
+         role: msg.role,
+         content: msg.content,
+       }));
+     } catch (error) {
+       this.outputChannel.appendLine(`[AgentEngine] Failed to build conversation history from StateStore: ${error}`);
+       return [];
+     }
+   }
 
-  private estimateTokens(content?: string | null): number {
-    if (!content) {
-      return 0;
-    }
-    return Math.ceil(content.length / 4);
-  }
+  /**
+   * 实时更新对话历史到 StateStore
+   * 确保对话过程中的每一步都被保存
+   * @param sessionId 会话 ID
+   * @param messages 当前消息数组
+   */
+  private updateConversationHistoryRealtime(sessionId: string, messages: LLMMessage[]): void {
+     try {
+       // 获取当前对话
+       let conversation = this.stateStore.getConversation(sessionId);
+       
+       // 如果对话不存在，创建新的
+       if (!conversation) {
+         conversation = this.stateStore.createConversation({
+           id: sessionId,
+           sessionId: sessionId,
+           title: 'Chat Session'
+         });
+       }
+       
+       // 只添加新的消息（避免重复添加）
+       const existingMessageCount = conversation.messages.length;
+       const newMessages = messages.slice(existingMessageCount);
+       
+       // 转换新的 LLMMessage 为 Message，确保内容不为空
+       const messageObjects: Message[] = newMessages
+         .filter(msg => msg.content && msg.content.trim().length > 0) // 过滤空消息
+         .map(msg => ({
+           id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+           conversationId: sessionId,
+           role: msg.role as 'user' | 'assistant',
+           content: msg.content.trim(), // 确保保存实际内容
+           timestamp: Date.now()
+         }));
+       
+       // 保存新消息到 StateStore
+       messageObjects.forEach(msg => {
+         this.stateStore.addMessageToConversation(sessionId, msg);
+       });
+       
+       if (messageObjects.length > 0) {
+         this.outputChannel.appendLine(`[AgentEngine] Updated conversation history for session ${sessionId}, added ${messageObjects.length} new messages`);
+       }
+     } catch (error) {
+       this.outputChannel.appendLine(`[AgentEngine] Failed to update conversation history: ${error}`);
+     }
+   }
 
   private broadcastTaskFailure(task: Task, sessionId: string | null, reason: string) {
     if (!sessionId || !this.shouldBroadcastTaskUpdate(task)) {

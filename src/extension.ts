@@ -21,11 +21,10 @@ let db: DatabaseManager;
 let globalConfigDb: GlobalConfigDatabase;
 let events: TypedEventEmitter;
 let services: Services;
-let agentEngine: AgentEngine | undefined;
+let agentEngines: Map<string, AgentEngine> = new Map();
 let currentSessionId: string | null = null;
 let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
-let activeAgentId: string | null = null;
 let performanceRecorder: PerformanceRecorder | undefined;
 let workspaceConfigManager: WorkspaceConfigManager | undefined;
 let integrationBridge: IntegrationBridge | undefined;
@@ -44,7 +43,7 @@ let assistDeadlineTimer: NodeJS.Timeout | null = null;
 class ArrangerWebviewViewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly minimalPanelProvider: MinimalPanelProvider
-  ) {}
+  ) { }
 
   resolveWebviewView(webviewView: vscode.WebviewView) {
     const webview = webviewView.webview;
@@ -165,6 +164,59 @@ async function selectAgent(agents: Agent[]): Promise<Agent | undefined> {
   return agents.find(agent => agent.id === pick.agentId);
 }
 
+import { FileWatcherService } from './application/services/file-watcher.service';
+
+// 自动启动所有已启用的 agent
+async function autoStartEnabledAgents(
+  agents: Agent[],
+  services: Services,
+  context: vscode.ExtensionContext,
+  outputChannel: vscode.OutputChannel
+) {
+  const enabledAgents = agents.filter(agent => agent.is_enabled);
+  if (enabledAgents.length === 0) {
+    outputChannel.appendLine('No enabled agents found to auto-start');
+    return;
+  }
+
+  // 创建默认会话（如果不存在）
+  if (!currentSessionId) {
+    const sessionId = `session-default`;
+    const session = services.session.createSession(sessionId);
+    currentSessionId = session.id;
+    outputChannel.appendLine(`[Session] Auto-created default session ${currentSessionId}`);
+  }
+
+  // 启动所有已启用的 agent
+  for (const agentRecord of enabledAgents) {
+    try {
+      // 检查是否已经在运行
+      if (agentEngines.has(agentRecord.id)) {
+        outputChannel.appendLine(`Agent ${agentRecord.display_name || agentRecord.id} is already running`);
+        continue;
+      }
+
+      const agentConfig = buildConfigFromAgent(agentRecord);
+
+      if (!services.state) {
+        outputChannel.appendLine(`StateStore is not initialized, cannot start AgentEngine for ${agentRecord.id}`);
+        continue;
+      }
+
+      const agentEngine = new AgentEngine(agentConfig, context, services, events, outputChannel, services.state);
+      agentEngines.set(agentRecord.id, agentEngine);
+      outputChannel.appendLine(`Agent Engine initialized for ${agentRecord.display_name || agentRecord.id}`);
+
+      await agentEngine.start(currentSessionId);
+      outputChannel.appendLine(`Agent ${agentRecord.display_name || agentRecord.id} auto-started successfully`);
+    } catch (error: any) {
+      outputChannel.appendLine(`Failed to auto-start agent ${agentRecord.display_name || agentRecord.id}: ${error.message}`);
+    }
+  }
+  
+  outputChannel.appendLine(`Auto-started ${enabledAgents.length} enabled agents`);
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   // 创建输出通道
   outputChannel = vscode.window.createOutputChannel('Arranger');
@@ -220,6 +272,11 @@ export async function activate(context: vscode.ExtensionContext) {
     void setupAceAutoMonitor(context);
     setupAssistDeadlineSweep(context);
 
+    // Initialize File Watcher
+    const fileWatcher = new FileWatcherService(services.aceContext, outputChannel);
+    fileWatcher.startWatching();
+    context.subscriptions.push({ dispose: () => fileWatcher.dispose() });
+
     const minimalPanelProvider = new MinimalPanelProvider(services, events);
     const arrangerViewProvider = new ArrangerWebviewViewProvider(minimalPanelProvider);
     context.subscriptions.push(
@@ -252,6 +309,9 @@ export async function activate(context: vscode.ExtensionContext) {
     } else {
       outputChannel.appendLine(`Found ${existingAgents.length} configured agents`);
     }
+
+    // 自动启动所有已启用的 agent
+    await autoStartEnabledAgents(existingAgents, services, context, outputChannel);
 
     performanceRecorder = new PerformanceRecorder(events, outputChannel, workspaceRoot);
     context.subscriptions.push({
@@ -307,212 +367,246 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(statusBarItem);
     outputChannel.appendLine('Status bar item created');
 
-  // 注册命令：打开面板
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.openPanel', () => {
-      openOrchestratorPanel();
-    })
-  );
+    // 注册命令：打开面板
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.openPanel', () => {
+        openOrchestratorPanel();
+      })
+    );
 
-  // 注册命令：启动 Agent
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.startAgent', async () => {
-      try {
-        const agents = services.agent.getAllAgents();
-        const agentRecord = await selectAgent(agents);
-        if (!agentRecord) {
-          return;
-        }
+    // 注册命令：启动 Agent
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.startAgent', async () => {
+        try {
+          const agents = services.agent.getAllAgents();
+          const agentRecord = await selectAgent(agents);
+          if (!agentRecord) {
+            return;
+          }
 
-        if (agentRecord.is_enabled === false) {
-          vscode.window.showWarningMessage('该 Agent 已停用，请先在全局配置中启用后再启动。');
-          return;
-        }
+          if (agentRecord.is_enabled === false) {
+            vscode.window.showWarningMessage('该 Agent 已停用，请先在全局配置中启用后再启动。');
+            return;
+          }
 
+          // 检查 agent 是否已经运行
+          if (agentEngines.has(agentRecord.id)) {
+            vscode.window.showInformationMessage(`Agent ${agentRecord.display_name || agentRecord.id} is already running`);
+            return;
+          }
 
+          const agentConfig = buildConfigFromAgent(agentRecord);
 
-        const agentConfig = buildConfigFromAgent(agentRecord);
+          if (!services.state) {
+            throw new Error('StateStore is not initialized, cannot start AgentEngine.');
+          }
 
-        if (agentEngine && activeAgentId !== agentRecord.id) {
-          await agentEngine.stop();
-          agentEngine = undefined;
-        }
-
-        if (!agentEngine) {
-          agentEngine = new AgentEngine(agentConfig, context, services, events, outputChannel);
-          activeAgentId = agentRecord.id;
+          const agentEngine = new AgentEngine(agentConfig, context, services, events, outputChannel, services.state);
+          agentEngines.set(agentRecord.id, agentEngine);
           outputChannel.appendLine(`Agent Engine initialized for ${agentRecord.display_name || agentRecord.id}`);
-        }
 
+          if (!currentSessionId) {
+            const sessionId = `session-${Date.now()}`;
+            const session = services.session.createSession(sessionId);
+            currentSessionId = session.id;
+            outputChannel.appendLine(`Session created: ${currentSessionId}`);
+          }
+
+          await agentEngine.start(currentSessionId);
+          vscode.window.showInformationMessage(`Agent ${agentRecord.display_name || agentRecord.id} started successfully`);
+          outputChannel.appendLine('Agent started via command');
+        } catch (error: any) {
+          vscode.window.showErrorMessage(`Failed to start agent: ${error.message}`);
+          outputChannel.appendLine(`Failed to start agent: ${error.message}`);
+        }
+      })
+    );
+
+    // 注册命令：停止 Agent
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.stopAgent', async () => {
+        try {
+          if (agentEngines.size === 0) {
+            vscode.window.showWarningMessage('No running agent engines to stop.');
+            return;
+          }
+
+          // 如果有多个 agent 在运行，让用户选择要停止的
+          let agentIdToStop: string;
+          if (agentEngines.size === 1) {
+            const firstKey = agentEngines.keys().next().value;
+            if (!firstKey) {
+              vscode.window.showWarningMessage('No running agent engines to stop.');
+              return;
+            }
+            agentIdToStop = firstKey;
+          } else {
+            const runningAgents = Array.from(agentEngines.keys()).map(id => {
+              const agent = services.agent.getAgent(id);
+              return {
+                label: agent?.display_name || id,
+                description: `ID: ${id}`,
+                id
+              };
+            });
+            
+            const selected = await vscode.window.showQuickPick(runningAgents, {
+              placeHolder: '选择要停止的 Agent'
+            });
+            
+            if (!selected) {
+              return;
+            }
+            agentIdToStop = selected.id;
+          }
+
+          // 停止指定的 Agent
+          const agentEngine = agentEngines.get(agentIdToStop);
+          if (agentEngine) {
+            await agentEngine.stop();
+            agentEngines.delete(agentIdToStop);
+            const agent = services.agent.getAgent(agentIdToStop);
+            vscode.window.showInformationMessage(`Agent ${agent?.display_name || agentIdToStop} stopped successfully`);
+            outputChannel.appendLine(`Agent ${agentIdToStop} stopped via command`);
+          }
+        } catch (error: any) {
+          vscode.window.showErrorMessage(`Failed to stop agent: ${error.message}`);
+          outputChannel.appendLine(`Failed to stop agent: ${error.message}`);
+        }
+      })
+    );
+
+    // 导出性能快照
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.exportPerformanceSnapshot', async () => {
+        if (!performanceRecorder || performanceRecorder.isEmpty()) {
+          vscode.window.showInformationMessage('暂无性能快照数据，请等待任务监控运行一段时间。');
+          return;
+        }
+        const snapshot = performanceRecorder.getSnapshot();
+        const doc = await vscode.workspace.openTextDocument({
+          content: JSON.stringify(snapshot, null, 2),
+          language: 'json'
+        });
+        await vscode.window.showTextDocument(doc, { preview: false });
+      })
+    );
+
+    // 注册命令：性能诊断
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.runPerformanceCheck', async () => {
+        try {
+          const metrics = services.task.getTaskMetrics();
+          const unreadNotifications = services.notification.getAllNotifications({ read: false });
+          outputChannel.appendLine('--- Arranger Performance Snapshot ---');
+          outputChannel.appendLine(`Tasks: total=${metrics.total}, running=${metrics.running}, queued=${metrics.queued}, blocked=${metrics.blocked}, failed=${metrics.failed}`);
+          if (metrics.sweep_duration_ms !== undefined) {
+            outputChannel.appendLine(`Last maintenance sweep: ${metrics.sweep_duration_ms} ms`);
+          }
+          if (metrics.last_timeout) {
+            outputChannel.appendLine(`Last timeout: ${metrics.last_timeout.message}`);
+          }
+          outputChannel.appendLine(`Unread notifications: ${unreadNotifications.length}`);
+          outputChannel.appendLine('--------------------------------------');
+          vscode.window.showInformationMessage('性能快照已写入 Arranger 输出面板');
+        } catch (error: any) {
+          vscode.window.showErrorMessage(`性能检测失败：${error?.message ?? error}`);
+          outputChannel.appendLine(`Performance check failed: ${error?.message ?? error}`);
+        }
+      })
+    );
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.testMcpServer', async () => {
+        try {
+          const servers = services.mcpServer.getAllServers();
+          if (servers.length === 0) {
+            vscode.window.showWarningMessage('尚未配置任何 MCP Server');
+            return;
+          }
+          const pick = await vscode.window.showQuickPick(
+            servers.map(server => ({
+              label: server.name + (server.enabled ? '' : ' (已禁用)'),
+              description: server.command,
+              server
+            })),
+            { placeHolder: '选择要检测的 MCP Server' }
+          );
+          if (!pick) {
+            return;
+          }
+          const server = pick.server;
+          const result = await services.mcp.pingServer(server);
+          events.emit('mcp_server_status', {
+            serverId: server.id,
+            available: result.available,
+            error: result.error ?? null,
+            toolCount: Array.isArray(result.tools) ? result.tools.length : null
+          });
+          if (result.available) {
+            vscode.window.showInformationMessage(`MCP Server ${server.name} 可用，工具数 ${Array.isArray(result.tools) ? result.tools.length : 0}`);
+          } else {
+            vscode.window.showErrorMessage(`MCP Server ${server.name} 不可用：${result.error ?? '未知错误'}`);
+          }
+        } catch (error: any) {
+          vscode.window.showErrorMessage(`检测 MCP Server 失败：${error?.message ?? error}`);
+        }
+      })
+    );
+
+    // 注册命令：创建任务
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.createTask', async () => {
         if (!currentSessionId) {
-          const sessionId = `session-${Date.now()}`;
-          const session = services.session.createSession(sessionId);
-          currentSessionId = session.id;
-          outputChannel.appendLine(`Session created: ${currentSessionId}`);
-        }
-
-        await agentEngine.start(currentSessionId);
-        vscode.window.showInformationMessage(`Agent ${agentRecord.display_name || agentRecord.id} started successfully`);
-        outputChannel.appendLine('Agent started via command');
-      } catch (error: any) {
-        vscode.window.showErrorMessage(`Failed to start agent: ${error.message}`);
-        outputChannel.appendLine(`Failed to start agent: ${error.message}`);
-      }
-    })
-  );
-
-  // 注册命令：停止 Agent
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.stopAgent', async () => {
-      try {
-        if (!agentEngine) {
-          vscode.window.showWarningMessage('No running agent engine to stop.');
+          vscode.window.showWarningMessage('No active session found');
           return;
         }
 
-        // 停止 Agent
-        await agentEngine.stop();
-        agentEngine = undefined;
-        activeAgentId = null;
-        vscode.window.showInformationMessage('Agent stopped successfully');
-        outputChannel.appendLine('Agent stopped via command');
-      } catch (error: any) {
-        vscode.window.showErrorMessage(`Failed to stop agent: ${error.message}`);
-        outputChannel.appendLine(`Failed to stop agent: ${error.message}`);
-      }
-    })
-  );
-
-  // 导出性能快照
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.exportPerformanceSnapshot', async () => {
-      if (!performanceRecorder || performanceRecorder.isEmpty()) {
-        vscode.window.showInformationMessage('暂无性能快照数据，请等待任务监控运行一段时间。');
-        return;
-      }
-      const snapshot = performanceRecorder.getSnapshot();
-      const doc = await vscode.workspace.openTextDocument({
-        content: JSON.stringify(snapshot, null, 2),
-        language: 'json'
-      });
-      await vscode.window.showTextDocument(doc, { preview: false });
-    })
-  );
-
-  // 注册命令：性能诊断
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.runPerformanceCheck', async () => {
-      try {
-        const metrics = services.task.getTaskMetrics();
-        const unreadNotifications = services.notification.getAllNotifications({ read: false });
-        outputChannel.appendLine('--- Arranger Performance Snapshot ---');
-        outputChannel.appendLine(`Tasks: total=${metrics.total}, running=${metrics.running}, queued=${metrics.queued}, blocked=${metrics.blocked}, failed=${metrics.failed}`);
-        if (metrics.sweep_duration_ms !== undefined) {
-          outputChannel.appendLine(`Last maintenance sweep: ${metrics.sweep_duration_ms} ms`);
-        }
-        if (metrics.last_timeout) {
-          outputChannel.appendLine(`Last timeout: ${metrics.last_timeout.message}`);
-        }
-        outputChannel.appendLine(`Unread notifications: ${unreadNotifications.length}`);
-        outputChannel.appendLine('--------------------------------------');
-        vscode.window.showInformationMessage('性能快照已写入 Arranger 输出面板');
-      } catch (error: any) {
-        vscode.window.showErrorMessage(`性能检测失败：${error?.message ?? error}`);
-        outputChannel.appendLine(`Performance check failed: ${error?.message ?? error}`);
-      }
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.testMcpServer', async () => {
-      try {
-        const servers = services.mcpServer.getAllServers();
-        if (servers.length === 0) {
-          vscode.window.showWarningMessage('尚未配置任何 MCP Server');
-          return;
-        }
-        const pick = await vscode.window.showQuickPick(
-          servers.map(server => ({
-            label: server.name + (server.enabled ? '' : ' (已禁用)'),
-            description: server.command,
-            server
-          })),
-          { placeHolder: '选择要检测的 MCP Server' }
-        );
-        if (!pick) {
-          return;
-        }
-        const server = pick.server;
-        const result = await services.mcp.pingServer(server);
-        events.emit('mcp_server_status', {
-          serverId: server.id,
-          available: result.available,
-          error: result.error ?? null,
-          toolCount: Array.isArray(result.tools) ? result.tools.length : null
+        const intent = await vscode.window.showInputBox({
+          prompt: 'Enter task intent',
+          placeHolder: 'e.g., Implement user authentication'
         });
-        if (result.available) {
-          vscode.window.showInformationMessage(`MCP Server ${server.name} 可用，工具数 ${Array.isArray(result.tools) ? result.tools.length : 0}`);
-        } else {
-          vscode.window.showErrorMessage(`MCP Server ${server.name} 不可用：${result.error ?? '未知错误'}`);
+
+        if (!intent) {
+          return;
         }
-      } catch (error: any) {
-        vscode.window.showErrorMessage(`检测 MCP Server 失败：${error?.message ?? error}`);
-      }
-    })
-  );
 
-  // 注册命令：创建任务
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.createTask', async () => {
-      if (!currentSessionId) {
-        vscode.window.showWarningMessage('Please start the agent first');
-        return;
-      }
-
-      const intent = await vscode.window.showInputBox({
-        prompt: 'Enter task intent',
-        placeHolder: 'e.g., Implement user authentication'
-      });
-
-      if (!intent) {
-        return;
-      }
-
-      const scope = await vscode.window.showInputBox({
-        prompt: 'Enter task scope',
-        placeHolder: 'e.g., src/auth/'
-      });
-
-      if (!scope) {
-        return;
-      }
-
-      try {
-        const task = services.task.createTask({
-          id: `task-${Date.now()}`,
-          session_id: currentSessionId,
-          title: intent,
-          intent,
-          description: null,
-          scope,
-          priority: 'medium',
-          labels: null,
-          due_at: null,
-          status: 'pending',
-          assigned_to: null
+        const scope = await vscode.window.showInputBox({
+          prompt: 'Enter task scope',
+          placeHolder: 'e.g., src/auth/'
         });
-        vscode.window.showInformationMessage(`Task created: ${task.id}`);
-      } catch (error: any) {
-        vscode.window.showErrorMessage(`Failed to create task: ${error.message}`);
-      }
-    })
-  );
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arranger.manageMcpServers', async () => {
-      await manageMcpServers(services, outputChannel);
-    })
-  );
+        if (!scope) {
+          return;
+        }
+
+        try {
+          const task = services.task.createTask({
+            id: `task-${Date.now()}`,
+            session_id: currentSessionId,
+            title: intent,
+            intent,
+            description: null,
+            scope,
+            priority: 'medium',
+            labels: null,
+            due_at: null,
+            status: 'pending',
+            assigned_to: null
+          });
+          vscode.window.showInformationMessage(`Task created: ${task.id}`);
+          outputChannel.appendLine(`Task created: ${task.id}, status: pending`);
+        } catch (error: any) {
+          vscode.window.showErrorMessage(`Failed to create task: ${error.message}`);
+        }
+      })
+    );
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand('arranger.manageMcpServers', async () => {
+        await manageMcpServers(services, outputChannel);
+      })
+    );
 
     // 状态栏项已在前面创建
 
@@ -526,6 +620,17 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  // 停止所有运行的 Agent Engines
+  for (const [agentId, agentEngine] of agentEngines) {
+    try {
+      outputChannel?.appendLine(`Stopping agent engine: ${agentId}`);
+      agentEngine.stop();
+    } catch (error: any) {
+      outputChannel?.appendLine(`Failed to stop agent engine ${agentId}: ${error.message}`);
+    }
+  }
+  agentEngines.clear();
+
   services?.mcp?.dispose();
   services?.managerOrchestrator?.dispose?.();
   services?.state?.dispose?.();

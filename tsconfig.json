@@ -13,7 +13,9 @@
     "resolveJsonModule": true,
     "moduleResolution": "node",
     "declaration": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "webview", "src/workflow/__tests__", "src/**/*.html"]

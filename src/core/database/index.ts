@@ -16,7 +16,8 @@ import type {
   AssistRequest,
   SensitiveKeyword,
   SensitiveOperationLog,
-  AceStateRecord
+  AceStateRecord,
+  Conversation,
 } from '../types';
 
 const describeError = (error: unknown): string => {
@@ -257,6 +258,20 @@ export class DatabaseManager {
       );
     `);
 
+    // Conversations - 对话表
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        messages TEXT,
+        metadata TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+      );
+    `);
+
     // File Changes - 文件变更记录表
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS file_changes (
@@ -294,9 +309,6 @@ export class DatabaseManager {
         }
       }
     };
-
-    // ==================== Sessions 表字段 ====================
-    ensureColumn('sessions', 'metadata', "ALTER TABLE sessions ADD COLUMN metadata TEXT");
 
     // ==================== Tasks 表字段 ====================
     ensureColumn('tasks', 'intent', "ALTER TABLE tasks ADD COLUMN intent TEXT");
@@ -424,45 +436,37 @@ export class DatabaseManager {
 
   // ==================== Sessions ====================
   
-  createSession(id: string, metadata: Record<string, any> | null = null): Session {
+  createSession(id: string): Session {
     const now = Date.now();
     const stmt = this.db.prepare(`
-      INSERT INTO sessions (id, created_at, updated_at, metadata)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO sessions (id, created_at, updated_at)
+      VALUES (?, ?, ?)
     `);
-    stmt.run(id, now, now, metadata ? JSON.stringify(metadata) : null);
-    return { id, created_at: now, updated_at: now, metadata: metadata ?? null };
+    stmt.run(id, now, now);
+    return { id, created_at: now, updated_at: now };
   }
 
   getSession(id: string): Session | null {
     const stmt = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
-    const row = stmt.get(id) as (Session & { metadata?: string | null }) | null;
+    const row = stmt.get(id) as Session | null;
     if (!row) {
       return null;
     }
     return {
       id: row.id,
       created_at: row.created_at,
-      updated_at: row.updated_at,
-      metadata: row.metadata ? JSON.parse(row.metadata) : null
+      updated_at: row.updated_at
     };
   }
 
   getAllSessions(): Session[] {
     const stmt = this.db.prepare('SELECT * FROM sessions ORDER BY created_at DESC');
-    const rows = stmt.all() as Array<Session & { metadata?: string | null }>;
+    const rows = stmt.all() as Session[];
     return rows.map(row => ({
       id: row.id,
       created_at: row.created_at,
-      updated_at: row.updated_at,
-      metadata: row.metadata ? JSON.parse(row.metadata) : null
+      updated_at: row.updated_at
     }));
-  }
-
-  updateSessionMetadata(id: string, metadata: Record<string, any> | null): Session | null {
-    const stmt = this.db.prepare('UPDATE sessions SET metadata = ?, updated_at = ? WHERE id = ?');
-    stmt.run(metadata ? JSON.stringify(metadata) : null, Date.now(), id);
-    return this.getSession(id);
   }
 
   deleteSessionCascade(id: string): void {
@@ -489,9 +493,75 @@ export class DatabaseManager {
         stmt.run(sessionId);
       });
 
-      const stmt = this.db.prepare('DELETE FROM sessions WHERE id = ?');
-      stmt.run(sessionId);
+    this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
     });
+  }
+
+
+  // ==================== Conversations ====================
+
+  upsertConversation(conversation: Conversation): Conversation {
+    const stmt = this.db.prepare(`
+      INSERT INTO conversations (
+        id, session_id, title, messages, metadata, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        session_id = excluded.session_id,
+        title = excluded.title,
+        messages = excluded.messages,
+        metadata = excluded.metadata,
+        updated_at = excluded.updated_at
+    `);
+
+    stmt.run(
+      conversation.id,
+      conversation.sessionId,
+      conversation.title,
+      this.serializeJson(conversation.messages),
+      this.serializeJson(conversation.metadata),
+      conversation.createdAt,
+      conversation.updatedAt
+    );
+
+    return conversation;
+  }
+
+  getConversation(id: string): Conversation | null {
+    const stmt = this.db.prepare('SELECT * FROM conversations WHERE id = ?');
+    const row = stmt.get(id) as any;
+    if (!row) {
+      return null;
+    }
+    return this.mapConversationRow(row);
+  }
+
+  getConversations(filters: { sessionId?: string }): Conversation[] {
+    let query = 'SELECT * FROM conversations WHERE 1=1';
+    const params: any[] = [];
+    if (filters.sessionId) {
+      query += ' AND session_id = ?';
+      params.push(filters.sessionId);
+    }
+    query += ' ORDER BY created_at DESC';
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...params) as any[];
+    return rows.map(row => this.mapConversationRow(row));
+  }
+
+  deleteConversation(id: string): void {
+    this.db.prepare('DELETE FROM conversations WHERE id = ?').run(id);
+  }
+
+  private mapConversationRow(row: any): Conversation {
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      title: row.title,
+      messages: row.messages ? JSON.parse(row.messages) : [],
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
   }
 
 

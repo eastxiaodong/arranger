@@ -2,7 +2,8 @@
 
 import { DatabaseManager } from '../../core/database';
 import { TypedEventEmitter } from '../../core/events/emitter';
-import type { BlackboardEntry } from '../../core/types';
+import type { BlackboardEntry, Message } from '../../core/types';
+import type { StateStore } from '../../domain/state/state.store';
 import { extractMentionsFromContent } from '../../utils/mentions';
 
 type SendMessageInput = Omit<BlackboardEntry, 'created_at' | 'category' | 'visibility' | 'payload'> & {
@@ -14,8 +15,9 @@ type SendMessageInput = Omit<BlackboardEntry, 'created_at' | 'category' | 'visib
 export class MessageService {
   constructor(
     private db: DatabaseManager,
-    private events: TypedEventEmitter
-  ) {}
+    private events: TypedEventEmitter,
+    private stateStore: StateStore
+  ) { }
 
   // 获取所有消息
   getAllMessages(filters?: { session_id?: string; agent_id?: string }): BlackboardEntry[] {
@@ -45,6 +47,12 @@ export class MessageService {
     });
     this.events.emit('messages_update', this.db.getBlackboardEntries({}));
     this.events.emit('message_posted', created);
+
+    // Sync to conversations for agent memory
+    if (category === 'user' || category === 'agent_summary' || category === 'agent_response') {
+      this.syncToConversation(message.session_id, message.agent_id, message.content);
+    }
+
     return created;
   }
 
@@ -87,9 +95,9 @@ export class MessageService {
     const expiredIds = allMessages
       .filter(msg => msg.expires_at && msg.expires_at < now)
       .map(msg => msg.id);
-    
+
     expiredIds.forEach(id => this.db.deleteBlackboardEntry(id));
-    
+
     if (expiredIds.length > 0) {
       this.events.emit('messages_update', this.db.getBlackboardEntries({}));
     }
@@ -114,5 +122,35 @@ export class MessageService {
       return 'event_log';
     }
     return 'blackboard';
+  }
+
+  private syncToConversation(sessionId: string, agentId: string, content: string): void {
+    try {
+      const conversationId = sessionId;
+      let conversation = this.stateStore.getConversation(conversationId);
+
+      if (!conversation) {
+        conversation = this.stateStore.createConversation({
+          id: conversationId,
+          sessionId: sessionId,
+          title: 'Agent Conversation',
+          metadata: null
+        });
+      }
+
+      const role = agentId === 'user' ? 'user' : 'assistant';
+      const messageObj: Message = {
+        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        conversationId: conversationId,
+        role: role,
+        content: content,
+        timestamp: Date.now()
+      };
+
+      this.stateStore.addMessageToConversation(conversationId, messageObj);
+    } catch (error: any) {
+      // Log error but don't fail the message send
+      console.error('[MessageService] Failed to sync to conversation:', error?.message || error);
+    }
   }
 }

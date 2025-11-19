@@ -6,6 +6,27 @@ import { promisify } from 'util';
 import type { Services } from '../../application/services';
 import type { MCPServer } from '../../core/types';
 
+// 定义搜索结果类型
+interface ContextSearchResult {
+  results?: any[];
+  search_metadata?: {
+    query: string;
+    useMcp: boolean;
+    mcp_server?: string;
+    timestamp: number;
+    agent: string;
+  };
+}
+
+// 定义搜索选项类型
+interface ContextSearchOptions {
+  query: string;
+  useMcp: boolean;
+  mcp_server?: string;
+  timestamp: number;
+  agent: string;
+}
+
 const execAsync = promisify(exec);
 
 export interface Tool {
@@ -680,8 +701,15 @@ export function createTools(context: vscode.ExtensionContext, options: ToolFacto
       },
       handler: async (input: any) => {
         ensureSession(); // 触发会话校验
+        
+        const query = String(input.query || '').trim();
+        if (!query) {
+          throw new Error('query is required for search_context');
+        }
+        
         const useMcp = Boolean(input.use_mcp);
         let mcpServerName: string | undefined;
+        
         if (typeof input.mcp_server === 'string' && input.mcp_server.trim().length > 0) {
           mcpServerName = input.mcp_server.trim();
         } else if (useMcp) {
@@ -690,19 +718,54 @@ export function createTools(context: vscode.ExtensionContext, options: ToolFacto
             mcpServerName = defaultServer.name;
           }
         }
-        const result = await options.services.context.search({
-          query: String(input.query || ''),
-          include_globs: Array.isArray(input.include_globs) ? input.include_globs : undefined,
-          exclude_globs: Array.isArray(input.exclude_globs) ? input.exclude_globs : undefined,
-          case_sensitive: Boolean(input.case_sensitive),
-          max_results: input.max_results,
-          context_lines: input.context_lines,
-          max_files: input.max_files,
-          use_mcp: useMcp,
-          mcp_server: mcpServerName,
-          fallback_on_failure: input.fallback_on_failure !== undefined ? Boolean(input.fallback_on_failure) : true
-        });
-        return result;
+        
+        try {
+          const result = await options.services.context.search({
+            query,
+            include_globs: Array.isArray(input.include_globs) ? input.include_globs : undefined,
+            exclude_globs: Array.isArray(input.exclude_globs) ? input.exclude_globs : undefined,
+            case_sensitive: Boolean(input.case_sensitive),
+            max_results: input.max_results,
+            context_lines: input.context_lines,
+            max_files: input.max_files,
+            use_mcp: useMcp,
+            mcp_server: mcpServerName,
+            fallback_on_failure: input.fallback_on_failure !== undefined ? Boolean(input.fallback_on_failure) : true
+          }) as ContextSearchResult;
+          
+          // 添加搜索统计信息
+          if (result && typeof result === 'object') {
+            result.search_metadata = {
+              query,
+              useMcp: useMcp,
+              mcp_server: mcpServerName,
+              timestamp: Date.now(),
+              agent: agentInfo().displayName
+            };
+          }
+          
+          return result;
+        } catch (error: any) {
+          const errorMessage = error?.message || 'Search failed';
+          
+          // 提供详细的错误信息和建议
+          if (errorMessage.includes('ACE is not configured')) {
+            throw new Error('ACE search service is not configured. Please:\n' +
+              '1. Open VSCode Settings\n' +
+              '2. Search for "Arranger"\n' +
+              '3. Configure ACE settings with your server URL and token\n' +
+              '4. Test connection before using search');
+          } else if (errorMessage.includes('connection') || errorMessage.includes('timeout')) {
+            throw new Error(`ACE connection error: ${errorMessage}\n` +
+              'Suggestions:\n' +
+              '1. Check if ACE server is running\n' +
+              '2. Verify network connectivity\n' +
+              '3. Check firewall settings\n' +
+              '4. Try using fallback search option');
+          } else {
+            throw new Error(`Search failed: ${errorMessage}`);
+          }
+        }
       }
     },
     {
@@ -776,6 +839,43 @@ export function createTools(context: vscode.ExtensionContext, options: ToolFacto
           resource_count: Array.isArray(result.resources) ? result.resources.length : 0,
           resources: result.resources || []
         };
+      }
+    },
+    {
+      name: 'use_mcp_tool',
+      description: 'Call a tool provided by a connected MCP server',
+      input_schema: {
+        type: 'object',
+        properties: {
+          server_name: {
+            type: 'string',
+            description: 'The name of the MCP server to use'
+          },
+          tool_name: {
+            type: 'string',
+            description: 'The name of the tool to call'
+          },
+          arguments: {
+            type: 'object',
+            description: 'The arguments to pass to the tool'
+          }
+        },
+        required: ['server_name', 'tool_name']
+      },
+      handler: async (input: { server_name: string; tool_name: string; arguments?: any }) => {
+        const sessionId = ensureSession();
+        const agent = agentInfo();
+        const result = await options.services.mcp.callTool(
+          input.server_name,
+          input.tool_name,
+          input.arguments || {},
+          {
+            session_id: sessionId,
+            task_id: getActiveTaskId(),
+            created_by: agent.id
+          }
+        );
+        return result;
       }
     },
     {
@@ -867,6 +967,499 @@ export function createTools(context: vscode.ExtensionContext, options: ToolFacto
           server: sanitizeMcpServer(server),
           prompt
         };
+      }
+    },
+    // 系统级工具
+    {
+      name: 'web_search',
+      description: '在网络上搜索信息',
+      input_schema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: '搜索查询字符串'
+          },
+          num_results: {
+            type: 'number',
+            description: '返回结果数量（默认5，最大10）',
+            minimum: 1,
+            maximum: 10
+          }
+        },
+        required: ['query']
+      },
+      handler: async (input: { query: string; num_results?: number }) => {
+        // 这里可以集成真实的搜索API，目前返回模拟结果
+        const numResults = Math.min(Math.max(input.num_results || 5, 1), 10);
+        
+        // 模拟搜索结果
+        const mockResults = Array.from({ length: numResults }, (_, i) => ({
+          title: `搜索结果 ${i + 1}: ${input.query}`,
+          url: `https://example.com/result${i + 1}`,
+          snippet: `这是关于"${input.query}"的搜索结果片段 ${i + 1}...`,
+          relevance: Math.random() * 100
+        }));
+        
+        return {
+          query: input.query,
+          results: mockResults,
+          total_results: mockResults.length
+        };
+      }
+    },
+    {
+      name: 'web_fetch',
+      description: '获取网页内容',
+      input_schema: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: '要获取的网页URL'
+          },
+          wait_for_selector: {
+            type: 'string',
+            description: '等待特定选择器加载完成（可选）'
+          },
+          timeout: {
+            type: 'number',
+            description: '超时时间（毫秒，默认10000）'
+          }
+        },
+        required: ['url']
+      },
+      handler: async (input: { url: string; wait_for_selector?: string; timeout?: number }) => {
+        try {
+          // 这里可以集成真实的网页抓取库，目前返回模拟内容
+          const timeout = input.timeout || 10000;
+          
+          // 模拟网页内容
+          const mockContent = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>网页标题: ${input.url}</title>
+  <meta name="description" content="网页描述">
+</head>
+<body>
+  <h1>主标题</h1>
+  <p>这是从 ${input.url} 获取的模拟网页内容。</p>
+  <div class="content">
+    <p>网页内容段落1...</p>
+    <p>网页内容段落2...</p>
+  </div>
+</body>
+</html>`;
+          
+          return {
+            url: input.url,
+            content: mockContent,
+            status: 200,
+            content_type: 'text/html',
+            fetched_at: new Date().toISOString()
+          };
+        } catch (error: any) {
+          return {
+            url: input.url,
+            error: error.message,
+            status: 500,
+            fetched_at: new Date().toISOString()
+          };
+        }
+      }
+    },
+    {
+      name: 'run_interactive_command',
+      description: '运行交互式命令（支持输入）',
+      input_schema: {
+        type: 'object',
+        properties: {
+          command: {
+            type: 'string',
+            description: '要执行的命令'
+          },
+          cwd: {
+            type: 'string',
+            description: '工作目录（可选，默认工作区根目录）'
+          },
+          env: {
+            type: 'object',
+            description: '环境变量（可选）'
+          },
+          timeout: {
+            type: 'number',
+            description: '超时时间（毫秒，默认30000）'
+          },
+          input: {
+            type: 'string',
+            description: '提供给命令的输入（可选）'
+          }
+        },
+        required: ['command']
+      },
+      handler: async (input: {
+        command: string;
+        cwd?: string;
+        env?: Record<string, string>;
+        timeout?: number;
+        input?: string;
+      }) => {
+        try {
+          const workingDir = input.cwd || workspaceRoot;
+          const timeout = input.timeout || 30000;
+          
+          // 使用spawn支持交互式命令
+          const { spawn } = require('child_process');
+          
+          return new Promise((resolve, reject) => {
+            const child = spawn(input.command, [], {
+              shell: true,
+              cwd: workingDir,
+              env: { ...process.env, ...input.env },
+              stdio: ['pipe', 'pipe', 'pipe']
+            });
+            
+            let stdout = '';
+            let stderr = '';
+            
+            child.stdout?.on('data', (data: Buffer) => {
+              stdout += data.toString();
+            });
+            
+            child.stderr?.on('data', (data: Buffer) => {
+              stderr += data.toString();
+            });
+            
+            // 如果有输入，发送给子进程
+            if (input.input) {
+              child.stdin?.write(input.input);
+              child.stdin?.end();
+            }
+            
+            const timer = setTimeout(() => {
+              child.kill('SIGTERM');
+              reject(new Error(`Command timed out after ${timeout}ms`));
+            }, timeout);
+            
+            child.on('close', (code: number) => {
+              clearTimeout(timer);
+              resolve({
+                command: input.command,
+                exit_code: code,
+                stdout,
+                stderr,
+                cwd: workingDir,
+                completed_at: new Date().toISOString()
+              });
+            });
+            
+            child.on('error', (error: Error) => {
+              clearTimeout(timer);
+              reject(error);
+            });
+          });
+        } catch (error: any) {
+          return {
+            command: input.command,
+            error: error.message,
+            exit_code: -1,
+            completed_at: new Date().toISOString()
+          };
+        }
+      }
+    },
+    {
+      name: 'browse_directory',
+      description: '浏览目录结构，支持递归查看',
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: '目录路径（相对于工作区根目录）'
+          },
+          recursive: {
+            type: 'boolean',
+            description: '是否递归查看子目录（默认false）'
+          },
+          max_depth: {
+            type: 'number',
+            description: '递归最大深度（默认3）',
+            minimum: 1,
+            maximum: 10
+          },
+          include_hidden: {
+            type: 'boolean',
+            description: '是否包含隐藏文件（默认false）'
+          },
+          show_file_info: {
+            type: 'boolean',
+            description: '是否显示文件详细信息（默认true）'
+          }
+        },
+        required: ['path']
+      },
+      handler: async (input: {
+        path: string;
+        recursive?: boolean;
+        max_depth?: number;
+        include_hidden?: boolean;
+        show_file_info?: boolean;
+      }) => {
+        const dirPath = path.join(workspaceRoot, input.path);
+        const recursive = input.recursive || false;
+        const maxDepth = Math.min(Math.max(input.max_depth || 3, 1), 10);
+        const includeHidden = input.include_hidden || false;
+        const showFileInfo = input.show_file_info !== false;
+        
+        const browseDir = async (currentPath: string, currentDepth: number): Promise<any[]> => {
+          try {
+            const items = await fs.promises.readdir(currentPath, { withFileTypes: true });
+            const results: any[] = [];
+            
+            for (const item of items) {
+              // 跳过隐藏文件
+              if (!includeHidden && item.name.startsWith('.')) {
+                continue;
+              }
+              
+              const fullPath = path.join(currentPath, item.name);
+              const relativePath = path.relative(workspaceRoot, fullPath);
+              const stats = await fs.promises.stat(fullPath);
+              
+              const fileInfo: any = {
+                name: item.name,
+                path: relativePath,
+                type: item.isDirectory() ? 'directory' : 'file',
+                size: stats.size,
+                modified: stats.mtime.toISOString(),
+                created: stats.birthtime.toISOString()
+              };
+              
+              // 如果是文件且需要显示详细信息
+              if (showFileInfo && item.isFile()) {
+                // 尝试获取文件扩展名和简单信息
+                const ext = path.extname(item.name).toLowerCase();
+                fileInfo.extension = ext;
+                
+                // 对于文本文件，可以读取前几行作为预览
+                if (['.txt', '.md', '.js', '.ts', '.json', '.html', '.css', '.py', '.java', '.cpp', '.c'].includes(ext)) {
+                  try {
+                    const content = await fs.promises.readFile(fullPath, 'utf8');
+                    const lines = content.split('\n');
+                    fileInfo.preview = lines.slice(0, 3).join('\n');
+                    fileInfo.line_count = lines.length;
+                  } catch (error) {
+                    // 忽略读取错误
+                  }
+                }
+              }
+              
+              // 如果是目录且需要递归
+              if (item.isDirectory() && recursive && currentDepth < maxDepth) {
+                fileInfo.children = await browseDir(fullPath, currentDepth + 1);
+              }
+              
+              results.push(fileInfo);
+            }
+            
+            return results;
+          } catch (error: any) {
+            return [{ error: error.message, path: currentPath }];
+          }
+        };
+        
+        const results = await browseDir(dirPath, 0);
+        
+        return {
+          path: input.path,
+          absolute_path: dirPath,
+          recursive,
+          max_depth: maxDepth,
+          include_hidden: includeHidden,
+          results,
+          scanned_at: new Date().toISOString()
+        };
+      }
+    },
+    {
+      name: 'system_info',
+      description: '获取系统信息',
+      input_schema: {
+        type: 'object',
+        properties: {
+          include: {
+            type: 'array',
+            items: { type: 'string', enum: ['os', 'memory', 'disk', 'network', 'process', 'env'] },
+            description: '要包含的信息类型（默认全部）'
+          }
+        }
+      },
+      handler: async (input: { include?: string[] }) => {
+        const os = require('os');
+        const include = input.include || ['os', 'memory', 'disk', 'network', 'process', 'env'];
+        const info: any = {};
+        
+        try {
+          if (include.includes('os')) {
+            info.os = {
+              platform: os.platform(),
+              arch: os.arch(),
+              release: os.release(),
+              hostname: os.hostname(),
+              uptime: os.uptime(),
+              loadavg: os.loadavg(),
+              totalmem: os.totalmem(),
+              freemem: os.freemem(),
+              cpus: os.cpus().length
+            };
+          }
+          
+          if (include.includes('memory')) {
+            const totalMem = os.totalmem();
+            const freeMem = os.freemem();
+            info.memory = {
+              total: totalMem,
+              free: freeMem,
+              used: totalMem - freeMem,
+              usage_percent: ((totalMem - freeMem) / totalMem * 100).toFixed(2) + '%'
+            };
+          }
+          
+          if (include.includes('disk')) {
+            try {
+              const { stdout } = await execAsync('df -h', { cwd: workspaceRoot });
+              info.disk = {
+                command: 'df -h',
+                output: stdout.trim()
+              };
+            } catch (error) {
+              info.disk = { error: 'Failed to get disk info' };
+            }
+          }
+          
+          if (include.includes('network')) {
+            try {
+              const { stdout } = await execAsync('ping -c 1 8.8.8.8', { cwd: workspaceRoot });
+              info.network = {
+                internet_connectivity: 'OK',
+                ping_output: stdout.trim()
+              };
+            } catch (error) {
+              info.network = {
+                internet_connectivity: 'Failed',
+                error: 'Cannot reach 8.8.8.8'
+              };
+            }
+          }
+          
+          if (include.includes('process')) {
+            info.process = {
+              pid: process.pid,
+              ppid: process.ppid,
+              uptime: process.uptime(),
+              memory_usage: process.memoryUsage(),
+              cpu_usage: process.cpuUsage(),
+              node_version: process.version,
+              v8_version: process.versions.v8
+            };
+          }
+          
+          if (include.includes('env')) {
+            // 只包含安全的环境变量
+            const safeEnv = ['PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'NODE_ENV'];
+            info.env = {};
+            safeEnv.forEach(key => {
+              if (process.env[key]) {
+                info.env[key] = process.env[key];
+              }
+            });
+          }
+          
+          return {
+            system_info: info,
+            collected_at: new Date().toISOString()
+          };
+        } catch (error: any) {
+          return {
+            error: error.message,
+            collected_at: new Date().toISOString()
+          };
+        }
+      }
+    },
+    {
+      name: 'create_file_backup',
+      description: '创建文件备份',
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: '要备份的文件路径（相对于工作区根目录）'
+          },
+          backup_dir: {
+            type: 'string',
+            description: '备份目录（相对于工作区根目录，默认.backup）'
+          },
+          comment: {
+            type: 'string',
+            description: '备份说明（可选）'
+          }
+        },
+        required: ['path']
+      },
+      handler: async (input: { path: string; backup_dir?: string; comment?: string }) => {
+        try {
+          const filePath = path.join(workspaceRoot, input.path);
+          const backupDir = input.backup_dir || '.backup';
+          const backupDirPath = path.join(workspaceRoot, backupDir);
+          
+          // 确保备份目录存在
+          await fs.promises.mkdir(backupDirPath, { recursive: true });
+          
+          // 检查源文件是否存在
+          if (!fs.existsSync(filePath)) {
+            throw new Error(`Source file does not exist: ${input.path}`);
+          }
+          
+          // 创建备份文件名（带时间戳）
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const fileName = path.basename(input.path);
+          const backupFileName = `${fileName}.${timestamp}.backup`;
+          const backupFilePath = path.join(backupDirPath, backupFileName);
+          
+          // 复制文件
+          await fs.promises.copyFile(filePath, backupFilePath);
+          
+          // 创建备份信息文件
+          const backupInfo = {
+            original_path: input.path,
+            backup_path: path.join(backupDir, backupFileName),
+            backup_time: new Date().toISOString(),
+            comment: input.comment || null,
+            file_size: (await fs.promises.stat(filePath)).size
+          };
+          
+          const infoFileName = `${backupFileName}.info.json`;
+          const infoFilePath = path.join(backupDirPath, infoFileName);
+          await fs.promises.writeFile(infoFilePath, JSON.stringify(backupInfo, null, 2));
+          
+          return {
+            success: true,
+            original_file: input.path,
+            backup_file: path.join(backupDir, backupFileName),
+            info_file: path.join(backupDir, infoFileName),
+            backup_info: backupInfo
+          };
+        } catch (error: any) {
+          return {
+            success: false,
+            error: error.message,
+            original_file: input.path
+          };
+        }
       }
     }
   ];

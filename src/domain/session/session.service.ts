@@ -1,8 +1,6 @@
-// Session 服务
-
 import { DatabaseManager } from '../../core/database';
 import { TypedEventEmitter } from '../../core/events/emitter';
-import type { Session } from '../../core/types';
+import type { Session as SessionRecord } from '../../core/types';
 
 export class SessionService {
   constructor(
@@ -10,52 +8,26 @@ export class SessionService {
     private events: TypedEventEmitter
   ) {}
 
-  // 获取所有会话
-  getAllSessions(): Session[] {
+  getAllSessions(): SessionRecord[] {
     return this.db.getAllSessions();
   }
 
-  // 获取单个会话
-  getSession(id: string): Session | null {
+  getSession(id: string): SessionRecord | null {
     return this.db.getSession(id);
   }
 
-  // 创建会话
-  createSession(id: string, metadata?: Record<string, any> | null): Session {
-    const session = this.db.createSession(id, metadata ?? null);
+  createSession(id: string): SessionRecord {
+    const session = this.db.createSession(id);
     this.broadcastSessions();
     return session;
   }
 
-  // 获取或创建会话
-  getOrCreateSession(id: string, metadata?: Record<string, any> | null): Session {
+  getOrCreateSession(id: string): SessionRecord {
     const existing = this.db.getSession(id);
     if (existing) {
-      if (metadata && Object.keys(metadata).length > 0) {
-        return this.mergeMetadata(id, metadata) ?? existing;
-      }
       return existing;
     }
-    return this.createSession(id, metadata ?? null);
-  }
-
-  mergeMetadata(id: string, patch: Record<string, any> | null): Session | null {
-    if (!patch || Object.keys(patch).length === 0) {
-      return this.db.getSession(id);
-    }
-    const current = this.db.getSession(id);
-    if (!current) {
-      return null;
-    }
-    const nextMetadata = {
-      ...(current.metadata || {}),
-      ...patch
-    };
-    const updated = this.db.updateSessionMetadata(id, nextMetadata);
-    if (updated) {
-      this.broadcastSessions();
-    }
-    return updated;
+    return this.createSession(id);
   }
 
   deleteSession(id: string): void {
@@ -64,8 +36,21 @@ export class SessionService {
   }
 
   private broadcastSessions() {
-    if (this.events) {
-      this.events.emit('sessions_update', this.getAllSessions());
+    this.events.emit('sessions_update', this.getAllSessions());
+  }
+
+  // 兼容接口：记录消息
+  addMessage(message: any): void {
+    if (!message?.session_id) {
+      return;
     }
+    if (!this.db.getSession(message.session_id)) {
+      this.createSession(message.session_id);
+    }
+  }
+
+  // 兼容接口：获取会话消息（简单回传 DB 黑板消息）
+  getMessages(sessionId: string): any[] {
+    return this.db.getBlackboardEntries({ session_id: sessionId });
   }
 }

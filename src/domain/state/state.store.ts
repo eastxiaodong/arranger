@@ -4,7 +4,7 @@
  */
 
 import { TypedEventEmitter } from '../../core/events/emitter';
-import type { DatabaseManager } from '../../core/database';
+import { DatabaseManager } from '../../core/database';
 import type {
   Task,
   TaskStateRecord,
@@ -25,13 +25,32 @@ import type {
   AceRunSummary,
   AceRunType,
   ToolRun,
-  ToolRunFilter
+  ToolRunFilter,
+  Conversation,
+  Message
 } from '../../core/types';
+
+/**
+ * 定义了任务状态之间所有合法的转移路径。
+ * key: 当前状态 (from)
+ * value: Set<下一个合法状态 (to)>
+ */
+const TASK_STATE_TRANSITIONS: Record<TaskState, Set<TaskState>> = {
+  'pending': new Set(['active', 'blocked']),
+  'active': new Set(['blocked', 'needs-confirm', 'finalizing', 'failed']),
+  'blocked': new Set(['reassigning', 'active']),
+  'needs-confirm': new Set(['active', 'blocked']),
+  'reassigning': new Set(['active', 'blocked']),
+  'finalizing': new Set(['done']),
+  'failed': new Set(['reassigning', 'blocked']),
+  'done': new Set([]), // 终态，不可转移
+};
 
 export class StateStore {
   private taskStates = new Map<string, TaskStateRecord>();
   private assistRequests = new Map<string, AssistRequest>();
   private agentHealth = new Map<string, AgentHealthRecord>();
+  private conversations = new Map<string, Conversation>(); // 新增：用于存储对话历史
   private sensitiveKeywords = new Map<string, SensitiveKeyword>();
   private sensitiveOperationLogs: SensitiveOperationLog[] = [];
   private aceStates = new Map<string, AceStateRecord>();
@@ -60,12 +79,13 @@ export class StateStore {
     this.taskStates.clear();
     this.assistRequests.clear();
     this.agentHealth.clear();
+    this.conversations.clear();
     this.sensitiveKeywords.clear();
     this.sensitiveOperationLogs = [];
     this.aceStates.clear();
     this.toolRuns = [];
     this.initialized = false;
-    this.events.emit('state:all_cleared', null as any);
+    this.events.emit('state:all_cleared', null);
   }
 
   private reloadAll() {
@@ -80,6 +100,10 @@ export class StateStore {
     this.assistRequests.clear();
     const storedAssists = this.db.getStateAssistRequests();
     storedAssists.forEach(request => this.assistRequests.set(request.id, request));
+
+    this.conversations.clear();
+    const storedConversations = this.db.getConversations({});
+    storedConversations.forEach(convo => this.conversations.set(convo.id, convo));
 
     this.toolRuns = this.db.getToolRuns({ limit: this.toolRunCacheLimit });
 
@@ -180,7 +204,7 @@ export class StateStore {
       updatedAt: now
     };
     this.persistTaskState(taskState);
-    this.events.emit('state:task_created', taskState);
+    this.events.emit('state:task_created', taskState); // 强类型事件
     
     return taskState;
   }
@@ -200,26 +224,11 @@ export class StateStore {
       return taskState;
     }
 
-    const allowedTransitions = new Set<string>([
-      'pending->active',
-      'pending->blocked',
-      'active->blocked',
-      'active->needs-confirm',
-      'active->finalizing',
-      'active->failed',
-      'blocked->reassigning',
-      'blocked->active',
-      'needs-confirm->active',
-      'needs-confirm->blocked',
-      'reassigning->active',
-      'reassigning->blocked',
-      'finalizing->done',
-      'failed->reassigning',
-      'failed->blocked'
-    ]);
-    const transitionKey = `${taskState.state}->${newState}`;
-    if (!allowedTransitions.has(transitionKey)) {
-      console.warn(`[StateStore] 拒绝非法状态转移：${transitionKey}，reason=${reason}, by=${triggeredBy}`);
+    const allowedNextStates = TASK_STATE_TRANSITIONS[taskState.state];
+    if (!allowedNextStates || !allowedNextStates.has(newState)) {
+      console.warn(
+        `[StateStore] 拒绝非法状态转移: 从 ${taskState.state} 到 ${newState}。原因: ${reason}, 操作者: ${triggeredBy}`
+      );
       return taskState;
     }
 
@@ -237,7 +246,7 @@ export class StateStore {
     taskState.updatedAt = Date.now();
 
     this.persistTaskState(taskState);
-    this.events.emit('state:task_transitioned', { taskState, transition });
+    this.events.emit('state:task_transitioned', { taskState, transition }); // 强类型事件
     
     return taskState;
   }
@@ -250,7 +259,7 @@ export class StateStore {
 
     Object.assign(taskState, updates, { updatedAt: Date.now() });
     this.persistTaskState(taskState);
-    this.events.emit('state:task_updated', taskState);
+    this.events.emit('state:task_updated', taskState); // 强类型事件
     
     return taskState;
   }
@@ -259,7 +268,7 @@ export class StateStore {
     const deleted = this.taskStates.delete(taskId);
     if (deleted) {
       this.db.deleteStateTaskState(taskId);
-      this.events.emit('state:task_deleted', taskId);
+      this.events.emit('state:task_deleted', taskId); // 强类型事件
     }
     return deleted;
   }
@@ -312,7 +321,7 @@ export class StateStore {
       completedAt: null
     };
     this.persistAssistRequest(assistRequest);
-    this.events.emit('state:assist_created', assistRequest);
+    this.events.emit('state:assist_created', assistRequest); // 强类型事件
     
     return assistRequest;
   }
@@ -330,7 +339,7 @@ export class StateStore {
     }
 
     this.persistAssistRequest(request);
-    this.events.emit('state:assist_updated', request);
+    this.events.emit('state:assist_updated', request); // 强类型事件
     
     return request;
   }
@@ -339,7 +348,7 @@ export class StateStore {
     const deleted = this.assistRequests.delete(id);
     if (deleted) {
       this.db.deleteStateAssistRequest(id);
-      this.events.emit('state:assist_deleted', id);
+      this.events.emit('state:assist_deleted', id); // 强类型事件
     }
     return deleted;
   }
@@ -375,28 +384,25 @@ export class StateStore {
   }
 
   updateAgentHealth(agentId: string, updates: Partial<Omit<AgentHealthRecord, 'agentId'>>): AgentHealthRecord {
-    const existing = this.agentHealth.get(agentId);
     const now = Date.now();
-    
-    const health: AgentHealthRecord = existing
-      ? { ...existing, ...updates, updatedAt: now }
-      : {
-          agentId,
-          status: 'healthy',
-          lastHeartbeat: now,
-          activeTaskCount: 0,
-          completedTaskCount: 0,
-          failedTaskCount: 0,
-          avgResponseTime: 0,
-          errorRate: 0,
-          capabilities: [],
-          metadata: {},
-          ...updates,
-          updatedAt: now
-        };
+    const existing = this.agentHealth.get(agentId) ?? {
+      agentId,
+      status: 'healthy',
+      lastHeartbeat: now,
+      activeTaskCount: 0,
+      completedTaskCount: 0,
+      failedTaskCount: 0,
+      avgResponseTime: 0,
+      errorRate: 0,
+      capabilities: [],
+      metadata: {},
+      updatedAt: now
+    };
+
+    const health: AgentHealthRecord = { ...existing, ...updates, updatedAt: now };
     
     this.agentHealth.set(agentId, health);
-    this.events.emit('state:agent_health_updated', health);
+    this.events.emit('state:agent_health_updated', health); // 强类型事件
     
     return health;
   }
@@ -404,7 +410,49 @@ export class StateStore {
   deleteAgentHealth(agentId: string): boolean {
     const deleted = this.agentHealth.delete(agentId);
     if (deleted) {
-      this.events.emit('state:agent_health_deleted', agentId);
+      this.events.emit('state:agent_health_deleted', agentId); // 强类型事件
+    }
+    return deleted;
+  }
+
+  // ==================== 对话历史管理 ====================
+
+  getConversation(id: string): Conversation | null {
+    return this.conversations.get(id) || null;
+  }
+
+  createConversation(convo: Omit<Conversation, 'createdAt' | 'updatedAt' | 'messages'>): Conversation {
+    const now = Date.now();
+    const newConversation: Conversation = {
+      ...convo,
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.db.upsertConversation(newConversation);
+    this.conversations.set(newConversation.id, newConversation);
+    this.events.emit('state:conversation_created', newConversation); // 强类型事件
+    return newConversation;
+  }
+
+  addMessageToConversation(conversationId: string, message: Message): Conversation | null {
+    const convo = this.conversations.get(conversationId);
+    if (!convo) {
+      return null;
+    }
+    convo.messages.push(message);
+    convo.updatedAt = Date.now();
+    this.db.upsertConversation(convo);
+    this.conversations.set(conversationId, convo);
+    this.events.emit('state:conversation_updated', convo); // 强类型事件
+    return convo;
+  }
+
+  deleteConversation(id: string): boolean {
+    const deleted = this.conversations.delete(id);
+    if (deleted) {
+      this.db.deleteConversation(id);
+      this.events.emit('state:conversation_deleted', id); // 强类型事件
     }
     return deleted;
   }
@@ -447,7 +495,7 @@ export class StateStore {
       session_id: run.session_id ?? 'global'
     });
     this.upsertToolRunCache(record);
-    this.events.emit('state:tool_run_created', record);
+    this.events.emit('state:tool_run_created', record); // 强类型事件
     this.emitToolRunsUpdate(run.session_id ?? null);
     return record;
   }
@@ -458,7 +506,7 @@ export class StateStore {
       return null;
     }
     this.upsertToolRunCache(record);
-    this.events.emit('state:tool_run_updated', record);
+    this.events.emit('state:tool_run_updated', record); // 强类型事件
     this.emitToolRunsUpdate(record.session_id ?? null);
     return record;
   }
@@ -556,7 +604,7 @@ export class StateStore {
       }
     }
 
-    this.events.emit('state:ace_state_updated', record);
+    this.events.emit('state:ace_state_updated', record); // 强类型事件
     this.db.upsertStateAceState(record);
     return record;
   }
@@ -606,7 +654,7 @@ export class StateStore {
     };
     this.db.upsertStateSensitiveKeyword(record);
     this.sensitiveKeywords.set(keyword.id, record);
-    this.events.emit('state:keyword_created', record);
+    this.events.emit('state:keyword_created', record); // 强类型事件
     
     return record;
   }
@@ -619,7 +667,7 @@ export class StateStore {
 
     Object.assign(keyword, updates, { updatedAt: Date.now() });
     this.db.upsertStateSensitiveKeyword(keyword);
-    this.events.emit('state:keyword_updated', keyword);
+    this.events.emit('state:keyword_updated', keyword); // 强类型事件
     
     return keyword;
   }
@@ -628,7 +676,7 @@ export class StateStore {
     const deleted = this.sensitiveKeywords.delete(id);
     if (deleted) {
       this.db.deleteStateSensitiveKeyword(id);
-      this.events.emit('state:keyword_deleted', id);
+      this.events.emit('state:keyword_deleted', id); // 强类型事件
     }
     return deleted;
   }
@@ -638,7 +686,7 @@ export class StateStore {
   logSensitiveOperation(log: SensitiveOperationLog): void {
     this.db.appendStateSensitiveOperationLog(log);
     this.sensitiveOperationLogs.push(log);
-    this.events.emit('state:sensitive_operation_logged', log);
+    this.events.emit('state:sensitive_operation_logged', log); // 强类型事件
     
     // 保留最近 10000 条日志
     if (this.sensitiveOperationLogs.length > 10000) {
@@ -693,18 +741,16 @@ export class StateStore {
       ? this.queryTaskStates({ sessionId })
       : Array.from(this.taskStates.values());
 
-    const byState: Record<string, number> = {};
-    const byPriority: Record<string, number> = {};
-
-    tasks.forEach(task => {
-      byState[task.state] = (byState[task.state] || 0) + 1;
-      byPriority[task.priority] = (byPriority[task.priority] || 0) + 1;
-    });
+    const stats = tasks.reduce((acc, task) => {
+      acc.byState[task.state] = (acc.byState[task.state] || 0) + 1;
+      acc.byPriority[task.priority] = (acc.byPriority[task.priority] || 0) + 1;
+      return acc;
+    }, { byState: {} as Record<TaskState, number>, byPriority: {} as Record<string, number> });
 
     return {
       total: tasks.length,
-      byState: byState as Record<TaskState, number>,
-      byPriority
+      byState: stats.byState,
+      byPriority: stats.byPriority
     };
   }
 
@@ -717,24 +763,20 @@ export class StateStore {
   } {
     const agents = Array.from(this.agentHealth.values());
 
-    const byStatus: Record<string, number> = {};
-    let totalActiveTasks = 0;
-    let totalResponseTime = 0;
-    let totalErrorRate = 0;
-
-    agents.forEach(agent => {
-      byStatus[agent.status] = (byStatus[agent.status] || 0) + 1;
-      totalActiveTasks += agent.activeTaskCount;
-      totalResponseTime += agent.avgResponseTime;
-      totalErrorRate += agent.errorRate;
-    });
+    const stats = agents.reduce((acc, agent) => {
+      acc.byStatus[agent.status] = (acc.byStatus[agent.status] || 0) + 1;
+      acc.totalActiveTasks += agent.activeTaskCount;
+      acc.totalResponseTime += agent.avgResponseTime;
+      acc.totalErrorRate += agent.errorRate;
+      return acc;
+    }, { byStatus: {} as Record<AgentHealthStatus, number>, totalActiveTasks: 0, totalResponseTime: 0, totalErrorRate: 0 });
 
     return {
       total: agents.length,
-      byStatus: byStatus as Record<AgentHealthStatus, number>,
-      totalActiveTasks,
-      avgResponseTime: agents.length > 0 ? totalResponseTime / agents.length : 0,
-      avgErrorRate: agents.length > 0 ? totalErrorRate / agents.length : 0
+      byStatus: stats.byStatus,
+      totalActiveTasks: stats.totalActiveTasks,
+      avgResponseTime: agents.length > 0 ? stats.totalResponseTime / agents.length : 0,
+      avgErrorRate: agents.length > 0 ? stats.totalErrorRate / agents.length : 0
     };
   }
 
@@ -759,6 +801,15 @@ export class StateStore {
     });
     assistIds.forEach(id => this.assistRequests.delete(id));
 
+    // 清理对话历史
+    const convoIds: string[] = [];
+    this.conversations.forEach((convo, id) => {
+      if (convo.sessionId === sessionId) {
+        convoIds.push(id);
+      }
+    });
+    convoIds.forEach(id => this.conversations.delete(id));
+
     // 清理敏感操作日志
     this.sensitiveOperationLogs = this.sensitiveOperationLogs.filter(
       log => log.sessionId !== sessionId
@@ -769,17 +820,18 @@ export class StateStore {
       this.emitToolRunsUpdate();
     }
 
-    this.events.emit('state:session_cleared', sessionId);
+    this.events.emit('state:session_cleared', sessionId); // 强类型事件
   }
 
   clearAll(): void {
     this.taskStates.clear();
     this.assistRequests.clear();
     this.agentHealth.clear();
+    this.conversations.clear();
     this.sensitiveOperationLogs = [];
     this.aceStates.clear();
     this.toolRuns = [];
-    this.events.emit('state:all_cleared', null);
+    this.events.emit('state:all_cleared', null); // 强类型事件
   }
 
   private ensureAceStateRecord(workspaceRoot: string): AceStateRecord {
